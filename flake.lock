@@ -18,6 +18,29 @@
         "type": "github"
       }
     },
+    "nbx": {
+      "inputs": {
+        "flake-utils": [
+          "flake-utils"
+        ],
+        "nixpkgs": [
+          "nixpkgs"
+        ]
+      },
+      "locked": {
+        "lastModified": 1772380905,
+        "narHash": "sha256-pk6QzNI6J/3bUU6Jl/A2DwG9hwvMR4RZ1CqHPtq7cJY=",
+        "owner": "pschmitt",
+        "repo": "nbx",
+        "rev": "3d7f3216cf7d4f9585b1a5e680ffbb487b758a22",
+        "type": "github"
+      },
+      "original": {
+        "owner": "pschmitt",
+        "repo": "nbx",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1772198003,
@@ -37,6 +60,7 @@
     "root": {
       "inputs": {
         "flake-utils": "flake-utils",
+        "nbx": "nbx",
         "nixpkgs": "nixpkgs"
       }
     },

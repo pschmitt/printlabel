@@ -4,9 +4,12 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    nbx.url = "github:pschmitt/nbx";
+    nbx.inputs.nixpkgs.follows = "nixpkgs";
+    nbx.inputs.flake-utils.follows = "flake-utils";
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
+  outputs = { self, nixpkgs, flake-utils, nbx }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = import nixpkgs {
@@ -24,6 +27,8 @@
                 "unknown-dirty";
           in
           "${pkgs.lib.substring 0 8 self.lastModifiedDate}-${rev}";
+
+        nbxPkg = nbx.packages.${system}.default;
 
         python = pkgs.python3.withPackages (ps: with ps; [
           pillow
@@ -56,9 +61,11 @@
                 pkgs.bluez
                 pkgs.curl
                 pkgs.fontconfig
+                pkgs.fzf
                 pkgs.imagemagick
                 pkgs.jq
                 pkgs.kitty
+                nbxPkg
                 pkgs.qrencode
                 python
               ]} \
@@ -92,9 +99,11 @@
             pkgs.bluez
             pkgs.curl
             pkgs.fontconfig
+            pkgs.fzf
             pkgs.imagemagick
             pkgs.jq
             pkgs.kitty
+            nbxPkg
             pkgs.qrencode
             pkgs.shellcheck
             python

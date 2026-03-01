@@ -6,7 +6,7 @@ Usage:
   $(basename "$0") [options] TEXT
   $(basename "$0") [options] --image PATH
   $(basename "$0") [options] --qr TEXT
-  $(basename "$0") [options] --netbox DEVICE_ID
+  $(basename "$0") [options] --netbox [QUERY]
 
 Options:
   -h, --help           Show this help message
@@ -14,7 +14,7 @@ Options:
   -p, --printer MAC    Use the given printer MAC address
       --image PATH     Print an existing image file
       --qr TEXT        Generate and print a QR code
-      --netbox ID      Fetch device data from NetBox and print a device label
+      --netbox [QUERY] Resolve a NetBox device by id, name, serial, or asset tag
       --netbox-url URL NetBox base URL, overrides NETBOX_URL
       --netbox-token T NetBox API token, overrides NETBOX_API_TOKEN
       --qr-size PX     Set QR size in pixels before padding
@@ -28,6 +28,8 @@ Examples:
   $(basename "$0") --printer 98:6E:E8:47:C9:A3 --image label.png
   $(basename "$0") --qr 'https://example.com' --preview
   $(basename "$0") --netbox 123 --netbox-url https://netbox.example.com
+  $(basename "$0") --netbox Schmutzi
+  $(basename "$0") --netbox
   $(basename "$0") --qr 'https://example.com' --black
 EOF
 }
@@ -88,17 +90,6 @@ find_qrencode() {
   return 1
 }
 
-find_curl() {
-  if command -v curl >/dev/null 2>&1
-  then
-    printf '%s\n' "curl"
-    return 0
-  fi
-
-  echo "curl is required for --netbox mode." >&2
-  return 1
-}
-
 find_jq() {
   if command -v jq >/dev/null 2>&1
   then
@@ -107,6 +98,28 @@ find_jq() {
   fi
 
   echo "jq is required for --netbox mode." >&2
+  return 1
+}
+
+find_nbx() {
+  if command -v nbx >/dev/null 2>&1
+  then
+    printf '%s\n' "nbx"
+    return 0
+  fi
+
+  echo "nbx is required for --netbox mode." >&2
+  return 1
+}
+
+find_fzf() {
+  if command -v fzf >/dev/null 2>&1
+  then
+    printf '%s\n' "fzf"
+    return 0
+  fi
+
+  echo "fzf is required to choose between multiple NetBox devices." >&2
   return 1
 }
 
@@ -317,37 +330,166 @@ render_qr() {
   echo "QR mode (${qr_size}px)"
 }
 
-fetch_netbox_device() {
-  local curl_bin="$1"
+fetch_netbox_devices() {
+  local nbx_bin="$1"
   local jq_bin="$2"
   local netbox_url="$3"
   local netbox_token="$4"
-  local device_id="$5"
+  local netbox_query="${5:-}"
   local response
-  local auth_args=()
+  local exact_matches
+  local search_matches
 
-  if [[ -n "${netbox_token}" ]]
+  if [[ -z "${netbox_query}" ]]
   then
-    auth_args+=(-H "Authorization: Token ${netbox_token}")
+    NETBOX_URL="${netbox_url}" \
+      NETBOX_API_TOKEN="${netbox_token}" \
+      "${nbx_bin}" -j devices
+    return $?
   fi
 
-  response="$(
-    "${curl_bin}" \
-      --fail \
-      --silent \
-      --show-error \
-      -H "Accept: application/json" \
-      "${auth_args[@]}" \
-      "${netbox_url%/}/api/dcim/devices/${device_id}/"
+  if [[ "${netbox_query}" =~ ^[0-9]+$ ]]
+  then
+    response="$(
+      NETBOX_URL="${netbox_url}" \
+        NETBOX_API_TOKEN="${netbox_token}" \
+        "${nbx_bin}" -j devices "id=${netbox_query}"
+    )" || return 1
+
+    if [[ "$("${jq_bin}" -r 'length' <<< "${response}")" -gt 0 ]]
+    then
+      printf '%s\n' "${response}"
+      return 0
+    fi
+  fi
+
+  search_matches="$(
+    NETBOX_URL="${netbox_url}" \
+    NETBOX_API_TOKEN="${netbox_token}" \
+    "${nbx_bin}" -j devices "q=${netbox_query}"
   )" || return 1
 
-  printf '%s\n' "${response}" | "${jq_bin}" -r '
-    [
-      (.name // ""),
-      (.asset_tag // ""),
-      (.serial // "")
-    ] | @tsv
-  '
+  exact_matches="$(
+    # shellcheck disable=SC2016
+    "${jq_bin}" -c --arg query "${netbox_query}" '
+      map(
+        select(
+          (.name // "" | ascii_downcase) == ($query | ascii_downcase)
+          or (.serial // "" | ascii_downcase) == ($query | ascii_downcase)
+          or (.asset_tag // "" | ascii_downcase) == ($query | ascii_downcase)
+        )
+      )
+      | unique_by(.id)
+      | sort_by(.name // "", .asset_tag // "", .serial // "", .id)
+    ' <<< "${search_matches}"
+  )" || return 1
+
+  if [[ "$("${jq_bin}" -r 'length' <<< "${exact_matches}")" -gt 0 ]]
+  then
+    printf '%s\n' "${exact_matches}"
+    return 0
+  fi
+
+  "${jq_bin}" '
+    unique_by(.id)
+    | sort_by(.name // "", .asset_tag // "", .serial // "", .id)
+  ' <<< "${search_matches}"
+}
+
+select_netbox_device() {
+  local nbx_bin="$1"
+  local jq_bin="$2"
+  local netbox_url="$3"
+  local netbox_token="$4"
+  local netbox_query="${5:-}"
+  local fzf_bin
+  local devices_json
+  local device_count
+  local selected_line
+  local selected_id
+  local cache_file
+  local -a fzf_args
+
+  devices_json="$(
+    fetch_netbox_devices "${nbx_bin}" "${jq_bin}" "${netbox_url}" "${netbox_token}" "${netbox_query}"
+  )" || return 1
+
+  device_count="$("${jq_bin}" -r 'length' <<< "${devices_json}")" || return 1
+
+  if [[ "${device_count}" -eq 0 ]]
+  then
+    if [[ -n "${netbox_query}" ]]
+    then
+      echo "No NetBox device matched '${netbox_query}'." >&2
+    else
+      echo "No NetBox devices found." >&2
+    fi
+    return 1
+  fi
+
+  if [[ "${device_count}" -eq 1 ]]
+  then
+    "${jq_bin}" -c '.[0]' <<< "${devices_json}"
+    return 0
+  fi
+
+  fzf_bin="$(find_fzf)" || return 1
+  cache_file="$(mktemp printlabel-netbox-devices.XXXXXX.json)"
+  printf '%s\n' "${devices_json}" > "${cache_file}"
+  fzf_args=(
+    --delimiter=$'\t'
+    --with-nth=2
+    --nth=1
+    --prompt='NetBox device> '
+    --header='Select a device to print'
+    --preview-window='right:60%:wrap'
+    --preview "
+      ${jq_bin} -r --arg id {1} '
+        .[] |
+        select((.id | tostring) == \$id) |
+        [
+          \"ID: \" + (.id | tostring),
+          \"Name: \" + (.name // \"\"),
+          \"Asset tag: \" + (.asset_tag // \"\"),
+          \"Serial: \" + (.serial // \"\"),
+          \"Role: \" + (.role.name // \"\"),
+          \"Site: \" + (.site.name // \"\"),
+          \"Location: \" + (.location.name // \"\"),
+          \"URL: \" + (.display_url // \"\")
+        ] | join(\"\\n\")
+      ' '${cache_file}'
+    "
+  )
+
+  if [[ -n "${netbox_query}" ]]
+  then
+    fzf_args+=(--query "${netbox_query}")
+  fi
+
+  selected_line="$(
+    "${jq_bin}" -r '
+      .[] |
+      [
+        (.id | tostring),
+        (.name // ""),
+        (.asset_tag // ""),
+        (.serial // ""),
+        (.role.name // ""),
+        (.site.name // "")
+      ] | @tsv
+    ' "${cache_file}" | \
+      "${fzf_bin}" "${fzf_args[@]}"
+  )" || {
+    rm -f "${cache_file}"
+    return 1
+  }
+
+  selected_id="${selected_line%%$'\t'*}"
+  # shellcheck disable=SC2016
+  "${jq_bin}" -c --arg id "${selected_id}" '
+    .[] | select((.id | tostring) == $id)
+  ' "${cache_file}"
+  rm -f "${cache_file}"
 }
 
 render_netbox_label() {
@@ -480,15 +622,17 @@ preview_label() {
 }
 
 main() {
-  local curl_bin
   local image_tool
   local jq_bin
+  local nbx_bin
   local font_name
   local label_text
   local netbox_device_id=""
+  local netbox_device_json=""
+  local netbox_mode=""
+  local netbox_query=""
   local netbox_token="${NETBOX_API_TOKEN:-}"
   local netbox_url="${NETBOX_URL:-}"
-  local netbox_fields=""
   local printer_address
   local script_dir
   local image_file=""
@@ -502,6 +646,9 @@ main() {
   local raw_mode=""
   local labelmaker_args=()
   local qr_tool
+  local device_name=""
+  local asset_tag=""
+  local serial_number=""
 
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -527,15 +674,16 @@ main() {
         shift 2
         ;;
       --netbox)
-        if [[ -z "${2:-}" ]]
-        then
-          echo "Missing device ID after --netbox." >&2
-          usage >&2
-          return 2
-        fi
-        netbox_device_id="$2"
+        netbox_mode=1
         image_mode=1
-        shift 2
+        if [[ -n "${2:-}" ]] && [[ ! "${2}" == -* ]] && ! is_bdaddr "${2}"
+        then
+          netbox_query="$2"
+          shift 2
+        else
+          netbox_query=""
+          shift
+        fi
         ;;
       --netbox-url)
         if [[ -z "${2:-}" ]]
@@ -618,7 +766,7 @@ main() {
     return 2
   fi
 
-  if [[ -n "${netbox_device_id}" && ( -n "${image_file}" || -n "${qr_text}" ) ]]
+  if [[ -n "${netbox_mode}" && ( -n "${image_file}" || -n "${qr_text}" ) ]]
   then
     echo "Use only one of --image, --qr, or --netbox." >&2
     usage >&2
@@ -678,25 +826,29 @@ main() {
         labelmaker_args+=("-r")
       fi
       preview_label "${preview_mode}" || return 1
-    elif [[ -n "${netbox_device_id}" ]]
+    elif [[ -n "${netbox_mode}" ]]
     then
       if [[ -z "${netbox_url}" ]]
       then
         echo "NetBox mode requires --netbox-url or NETBOX_URL." >&2
         return 2
       fi
-      curl_bin="$(find_curl)" || return 1
       jq_bin="$(find_jq)" || return 1
+      nbx_bin="$(find_nbx)" || return 1
       font_name="$(find_font)"
       qr_tool="$(find_qrencode)" || return 1
       label_image="$(mktemp --suffix=.png printlabel.XXXXXX)"
       trap cleanup EXIT
 
-      netbox_fields="$(
-        fetch_netbox_device "${curl_bin}" "${jq_bin}" "${netbox_url}" "${netbox_token}" "${netbox_device_id}"
+      netbox_device_json="$(
+        select_netbox_device "${nbx_bin}" "${jq_bin}" "${netbox_url}" "${netbox_token}" "${netbox_query}"
       )" || return 1
 
-      IFS=$'\t' read -r device_name asset_tag serial_number <<< "${netbox_fields}"
+      netbox_device_id="$("${jq_bin}" -r '.id' <<< "${netbox_device_json}")" || return 1
+      device_name="$("${jq_bin}" -r '.name // ""' <<< "${netbox_device_json}")" || return 1
+      asset_tag="$("${jq_bin}" -r '.asset_tag // ""' <<< "${netbox_device_json}")" || return 1
+      serial_number="$("${jq_bin}" -r '.serial // ""' <<< "${netbox_device_json}")" || return 1
+
       if [[ -z "${device_name}" ]]
       then
         echo "NetBox device ${netbox_device_id} has no name." >&2
