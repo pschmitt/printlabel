@@ -1,0 +1,410 @@
+#!/usr/bin/env bash
+
+usage() {
+  cat <<EOF
+Usage:
+  $(basename "$0") "label to print" ["Bluetooth MAC address"]
+  $(basename "$0") --image IMAGE_FILE [--raw] [--invert] ["Bluetooth MAC address"]
+  $(basename "$0") --qr TEXT [--invert] ["Bluetooth MAC address"]
+  $(basename "$0") [--invert] "label to print" ["Bluetooth MAC address"]
+
+Environment:
+  PRINTLABEL_PREVIEW=1  Open a preview image before printing
+  PRINTLABEL_QR_SIZE=64 Target QR size in pixels before printer padding
+  PRINTLABEL_PRINTER   Preferred printer Bluetooth MAC address
+EOF
+}
+
+cleanup() {
+  if [[ -n "${label_image:-}" && -f "${label_image}" ]]
+  then
+    rm -f "${label_image}"
+  fi
+}
+
+find_magick() {
+  if command -v magick >/dev/null 2>&1
+  then
+    printf '%s\n' "magick"
+    return 0
+  fi
+
+  if command -v convert >/dev/null 2>&1
+  then
+    printf '%s\n' "convert"
+    return 0
+  fi
+
+  echo "ImageMagick is required but neither 'magick' nor 'convert' was found." >&2
+  return 1
+}
+
+find_font() {
+  local font_name
+
+  if command -v fc-match >/dev/null 2>&1
+  then
+    font_name="$(fc-match -f '%{file}\n' sans 2>/dev/null | head -n 1)"
+  fi
+
+  if [[ -n "${font_name:-}" ]]
+  then
+    printf '%s\n' "${font_name}"
+    return 0
+  fi
+
+  printf '%s\n' "DejaVu Sans"
+}
+
+find_qrencode() {
+  if command -v qrencode >/dev/null 2>&1
+  then
+    printf '%s\n' "qrencode"
+    return 0
+  fi
+
+  echo "qrencode is required for --qr mode." >&2
+  return 1
+}
+
+is_bdaddr() {
+  local value="$1"
+
+  [[ "${value}" =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ ]]
+}
+
+list_printer_candidates() {
+  bluetoothctl devices | awk '
+    $1 == "Device" && $3 ~ /^PT-P[0-9].*BT/ {
+      print $2
+    }
+  '
+}
+
+get_device_info() {
+  local printer_address="$1"
+
+  bluetoothctl info "${printer_address}" 2>/dev/null
+}
+
+prepare_printer_connection() {
+  local printer_address="$1"
+
+  bluetoothctl --timeout 3 scan on >/dev/null 2>&1 || true
+  bluetoothctl trust "${printer_address}" >/dev/null 2>&1 || true
+  bluetoothctl connect "${printer_address}" >/dev/null 2>&1 || true
+  sleep 2
+}
+
+discover_printer_address() {
+  local configured_address="${PRINTLABEL_PRINTER:-}"
+  local candidates=()
+  local preferred_candidates=()
+  local printer_address
+  local info
+
+  if [[ -n "${configured_address}" ]]
+  then
+    if ! is_bdaddr "${configured_address}"
+    then
+      echo "PRINTLABEL_PRINTER is not a valid Bluetooth MAC address: ${configured_address}" >&2
+      return 1
+    fi
+    printf '%s\n' "${configured_address}"
+    return 0
+  fi
+
+  mapfile -t candidates < <(list_printer_candidates)
+
+  if [[ ${#candidates[@]} -eq 0 ]]
+  then
+    echo "No known printer found. Scanning for nearby Brother label printers..." >&2
+    bluetoothctl --timeout 5 scan on >/dev/null 2>&1 || true
+    mapfile -t candidates < <(list_printer_candidates)
+  fi
+
+  if [[ ${#candidates[@]} -eq 0 ]]
+  then
+    echo "No Brother P-Touch printer was discovered." >&2
+    return 1
+  fi
+
+  if [[ ${#candidates[@]} -eq 1 ]]
+  then
+    printf '%s\n' "${candidates[0]}"
+    return 0
+  fi
+
+  for printer_address in "${candidates[@]}"
+  do
+    info="$(get_device_info "${printer_address}")"
+    if grep -Eq '^(\t| )*Trusted: yes$' <<< "${info}" || grep -Eq '^(\t| )*Paired: yes$' <<< "${info}"
+    then
+      preferred_candidates+=("${printer_address}")
+    fi
+  done
+
+  if [[ ${#preferred_candidates[@]} -eq 1 ]]
+  then
+    printf '%s\n' "${preferred_candidates[0]}"
+    return 0
+  fi
+
+  echo "Multiple Brother label printers were found. Set PRINTLABEL_PRINTER or pass the MAC address explicitly." >&2
+  printf '%s\n' "${candidates[@]}" >&2
+  return 1
+}
+
+apply_invert() {
+  local image_tool="$1"
+  local source_image="$2"
+  local target_image="$3"
+
+  "${image_tool}" \
+    "${source_image}" \
+    -negate \
+    "${target_image}"
+}
+
+render_label() {
+  local label_text="$1"
+  local image_tool="$2"
+  local font_name="$3"
+
+  if [[ "${label_text}" =~ [\]jgpq\|\\\$/@_(){}\[] ]]
+  then
+    "${image_tool}" \
+      -background white \
+      -fill black \
+      -font "${font_name}" \
+      -size x82 \
+      -gravity south \
+      "label:${label_text}" \
+      -splice 0x15 \
+      "${label_image}"
+    echo "standard mode"
+  else
+    "${image_tool}" \
+      -background white \
+      -fill black \
+      -font "${font_name}" \
+      -pointsize 86 \
+      "label:${label_text}" \
+      -splice 0x5 \
+      -bordercolor white \
+      -border 10x10 \
+      "${label_image}"
+    echo "UPPERCASE MODE (bigger font)"
+  fi
+}
+
+render_qr() {
+  local qr_text="$1"
+  local image_tool="$2"
+  local qr_tool="$3"
+  local qr_source_image
+  local qr_size="${PRINTLABEL_QR_SIZE:-64}"
+
+  if [[ ! "${qr_size}" =~ ^[0-9]+$ ]] || [[ "${qr_size}" -le 0 ]]
+  then
+    echo "PRINTLABEL_QR_SIZE must be a positive integer." >&2
+    return 1
+  fi
+
+  qr_source_image="$(mktemp --suffix=.png printlabel-qr.XXXXXX)"
+
+  "${qr_tool}" \
+    --level=M \
+    --margin=1 \
+    --size=1 \
+    --type=PNG \
+    --output="${qr_source_image}" \
+    "${qr_text}" || return 1
+
+  "${image_tool}" \
+    "${qr_source_image}" \
+    -filter point \
+    -resize "${qr_size}x${qr_size}" \
+    -gravity center \
+    -background white \
+    -extent "${qr_size}x${qr_size}" \
+    "${label_image}" || return 1
+
+  rm -f "${qr_source_image}"
+  echo "QR mode (${qr_size}px)"
+}
+
+preview_label() {
+  if [[ -z "${PRINTLABEL_PREVIEW:-}" ]]
+  then
+    return 0
+  fi
+
+  if ! command -v display >/dev/null 2>&1
+  then
+    echo "Preview requested but 'display' is not installed. Continuing without preview." >&2
+    return 0
+  fi
+
+  echo "Opening preview. Close the window to continue printing."
+  display "${label_image}"
+}
+
+main() {
+  local image_tool
+  local font_name
+  local label_text
+  local printer_address
+  local script_dir
+  local image_file=""
+  local image_mode=""
+  local invert_mode=""
+  local qr_text=""
+  local raw_mode=""
+  local labelmaker_args=()
+  local qr_tool
+
+  script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+  while [[ -n "${1:-}" ]]
+  do
+    case "$1" in
+      -h|--help)
+        usage
+        return 0
+        ;;
+      --image)
+        if [[ -z "${2:-}" ]]
+        then
+          echo "Missing image path after --image." >&2
+          usage >&2
+          return 2
+        fi
+        image_file="$2"
+        image_mode=1
+        shift 2
+        ;;
+      --qr)
+        if [[ -z "${2:-}" ]]
+        then
+          echo "Missing QR text after --qr." >&2
+          usage >&2
+          return 2
+        fi
+        qr_text="$2"
+        image_mode=1
+        shift 2
+        ;;
+      --raw)
+        raw_mode=1
+        shift
+        ;;
+      --invert)
+        invert_mode=1
+        shift
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+
+  if [[ -n "${image_file}" && -n "${qr_text}" ]]
+  then
+    echo "Use either --image or --qr, not both." >&2
+    usage >&2
+    return 2
+  fi
+
+  if [[ -n "${image_mode}" && $# -ne 1 && $# -ne 0 ]]
+  then
+    usage >&2
+    return 2
+  fi
+
+  if [[ -z "${image_mode}" && $# -ne 2 && $# -ne 1 ]]
+  then
+    usage >&2
+    return 2
+  fi
+
+  if [[ -n "${image_mode}" ]]
+  then
+    if [[ $# -eq 1 ]]
+    then
+      printer_address="$1"
+    else
+      printer_address="$(discover_printer_address)" || return 1
+    fi
+    image_tool="$(find_magick)" || return 1
+    if [[ -n "${image_file}" ]]
+    then
+      if [[ ! -f "${image_file}" ]]
+      then
+        echo "Image file not found: ${image_file}" >&2
+        return 1
+      fi
+      if [[ -n "${invert_mode}" ]]
+      then
+        label_image="$(mktemp --suffix=.png printlabel.XXXXXX)"
+        trap cleanup EXIT
+        apply_invert "${image_tool}" "${image_file}" "${label_image}" || return 1
+      else
+        label_image="${image_file}"
+      fi
+      if [[ -n "${raw_mode}" ]]
+      then
+        labelmaker_args+=("-r")
+      fi
+    else
+      qr_tool="$(find_qrencode)" || return 1
+      label_image="$(mktemp --suffix=.png printlabel.XXXXXX)"
+      trap cleanup EXIT
+
+      render_qr "${qr_text}" "${image_tool}" "${qr_tool}" || return 1
+      if [[ -n "${invert_mode}" ]]
+      then
+        apply_invert "${image_tool}" "${label_image}" "${label_image}" || return 1
+      fi
+      preview_label
+    fi
+  else
+    label_text="$1"
+    if [[ $# -eq 2 ]]
+    then
+      printer_address="$2"
+    else
+      printer_address="$(discover_printer_address)" || return 1
+    fi
+
+    image_tool="$(find_magick)" || return 1
+    font_name="$(find_font)"
+    label_image="$(mktemp --suffix=.png printlabel.XXXXXX)"
+    trap cleanup EXIT
+
+    render_label "${label_text}" "${image_tool}" "${font_name}" || return 1
+    if [[ -n "${invert_mode}" ]]
+    then
+      apply_invert "${image_tool}" "${label_image}" "${label_image}" || return 1
+    fi
+    preview_label
+  fi
+
+  if ! is_bdaddr "${printer_address}"
+  then
+    echo "Invalid Bluetooth MAC address: ${printer_address}" >&2
+    return 2
+  fi
+
+  echo "Using printer: ${printer_address}"
+  prepare_printer_connection "${printer_address}"
+
+  python3 "${script_dir}/labelmaker.py" -i "${label_image}" "${labelmaker_args[@]}" "${printer_address}"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]
+then
+  main "$@"
+fi
+
+# vim: set ft=bash ts=2 sw=2 et:
