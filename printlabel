@@ -3,15 +3,31 @@
 usage() {
   cat <<EOF
 Usage:
-  $(basename "$0") "label to print" ["Bluetooth MAC address"]
-  $(basename "$0") --image IMAGE_FILE [--raw] [--invert] ["Bluetooth MAC address"]
-  $(basename "$0") --qr TEXT [--invert] ["Bluetooth MAC address"]
-  $(basename "$0") [--invert] "label to print" ["Bluetooth MAC address"]
+  $(basename "$0") [options] TEXT
+  $(basename "$0") [options] --image PATH
+  $(basename "$0") [options] --qr TEXT
+  $(basename "$0") [options] --netbox DEVICE_ID
 
-Environment:
-  PRINTLABEL_PREVIEW=1  Open a preview image before printing
-  PRINTLABEL_QR_SIZE=64 Target QR size in pixels before printer padding
-  PRINTLABEL_PRINTER   Preferred printer Bluetooth MAC address
+Options:
+  -h, --help           Show this help message
+  -p, --printer MAC    Use the given printer MAC address
+      --image PATH     Print an existing image file
+      --qr TEXT        Generate and print a QR code
+      --netbox ID      Fetch device data from NetBox and print a device label
+      --netbox-url URL NetBox base URL, overrides NETBOX_URL
+      --netbox-token T NetBox API token, overrides NETBOX_API_TOKEN
+      --qr-size PX     Set QR size in pixels before padding
+      --black          Invert QR codes for black tape
+      --invert         Invert black and white
+      --preview        Preview in terminal when possible
+      --raw            Skip image preprocessing for --image
+
+Examples:
+  $(basename "$0") 'HELLO'
+  $(basename "$0") --printer 98:6E:E8:47:C9:A3 --image label.png
+  $(basename "$0") --qr 'https://example.com' --preview
+  $(basename "$0") --netbox 123 --netbox-url https://netbox.example.com
+  $(basename "$0") --qr 'https://example.com' --black
 EOF
 }
 
@@ -67,6 +83,28 @@ find_qrencode() {
   return 1
 }
 
+find_curl() {
+  if command -v curl >/dev/null 2>&1
+  then
+    printf '%s\n' "curl"
+    return 0
+  fi
+
+  echo "curl is required for --netbox mode." >&2
+  return 1
+}
+
+find_jq() {
+  if command -v jq >/dev/null 2>&1
+  then
+    printf '%s\n' "jq"
+    return 0
+  fi
+
+  echo "jq is required for --netbox mode." >&2
+  return 1
+}
+
 is_bdaddr() {
   local value="$1"
 
@@ -97,7 +135,7 @@ prepare_printer_connection() {
 }
 
 discover_printer_address() {
-  local configured_address="${PRINTLABEL_PRINTER:-}"
+  local configured_address="${1:-${PRINTLABEL_PRINTER:-}}"
   local candidates=()
   local preferred_candidates=()
   local printer_address
@@ -166,6 +204,40 @@ apply_invert() {
     "${target_image}"
 }
 
+can_preview_with_kitty() {
+  if [[ -z "${KITTY_WINDOW_ID:-}" ]]
+  then
+    return 1
+  fi
+
+  if ! command -v kitten >/dev/null 2>&1
+  then
+    return 1
+  fi
+
+  if ! [[ -t 1 ]]
+  then
+    return 1
+  fi
+
+  kitten icat --detect-support >/dev/null 2>&1
+}
+
+preview_label_with_kitty() {
+  local reply
+
+  kitten icat --stdin=no --transfer-mode=detect "${label_image}" || return 1
+  printf '\nPrint? (y|n) '
+  IFS= read -r -n 1 reply
+  printf '\n'
+  kitten icat --clear-all >/dev/null 2>&1 || true
+  if [[ "${reply}" != "y" ]]
+  then
+    echo "Aborted."
+    return 1
+  fi
+}
+
 render_label() {
   local label_text="$1"
   local image_tool="$2"
@@ -202,12 +274,13 @@ render_qr() {
   local qr_text="$1"
   local image_tool="$2"
   local qr_tool="$3"
+  local qr_size="$4"
+  local black_mode="$5"
   local qr_source_image
-  local qr_size="${PRINTLABEL_QR_SIZE:-64}"
 
   if [[ ! "${qr_size}" =~ ^[0-9]+$ ]] || [[ "${qr_size}" -le 0 ]]
   then
-    echo "PRINTLABEL_QR_SIZE must be a positive integer." >&2
+    echo "QR size must be a positive integer." >&2
     return 1
   fi
 
@@ -230,14 +303,133 @@ render_qr() {
     -extent "${qr_size}x${qr_size}" \
     "${label_image}" || return 1
 
+  if [[ -n "${black_mode}" ]]
+  then
+    apply_invert "${image_tool}" "${label_image}" "${label_image}" || return 1
+  fi
+
   rm -f "${qr_source_image}"
   echo "QR mode (${qr_size}px)"
 }
 
+fetch_netbox_device() {
+  local curl_bin="$1"
+  local jq_bin="$2"
+  local netbox_url="$3"
+  local netbox_token="$4"
+  local device_id="$5"
+  local response
+  local auth_args=()
+
+  if [[ -n "${netbox_token}" ]]
+  then
+    auth_args+=(-H "Authorization: Token ${netbox_token}")
+  fi
+
+  response="$(
+    "${curl_bin}" \
+      --fail \
+      --silent \
+      --show-error \
+      -H "Accept: application/json" \
+      "${auth_args[@]}" \
+      "${netbox_url%/}/api/dcim/devices/${device_id}/"
+  )" || return 1
+
+  printf '%s\n' "${response}" | "${jq_bin}" -r '
+    [
+      (.name // ""),
+      (.asset_tag // ""),
+      (.serial // "")
+    ] | @tsv
+  '
+}
+
+render_netbox_label() {
+  local image_tool="$1"
+  local qr_tool="$2"
+  local netbox_url="$3"
+  local device_id="$4"
+  local device_name="$5"
+  local asset_tag="$6"
+  local serial_number="$7"
+  local font_name="$8"
+  local qr_size="$9"
+  local black_mode="${10}"
+  local qr_source_image
+  local qr_image
+  local text_image
+  local text_block=""
+  local text_width=320
+
+  qr_source_image="$(mktemp --suffix=.png printlabel-qr.XXXXXX)"
+  qr_image="$(mktemp --suffix=.png printlabel-qr-rendered.XXXXXX)"
+  text_image="$(mktemp --suffix=.png printlabel-text.XXXXXX)"
+
+  "${qr_tool}" \
+    --level=M \
+    --margin=1 \
+    --size=1 \
+    --type=PNG \
+    --output="${qr_source_image}" \
+    "${netbox_url%/}/dcim/devices/${device_id}/" || return 1
+
+  "${image_tool}" \
+    "${qr_source_image}" \
+    -filter point \
+    -resize "${qr_size}x${qr_size}" \
+    -gravity center \
+    -background white \
+    -extent "${qr_size}x${qr_size}" \
+    "${qr_image}" || return 1
+
+  if [[ -n "${black_mode}" ]]
+  then
+    apply_invert "${image_tool}" "${qr_image}" "${qr_image}" || return 1
+  fi
+
+  text_block="${device_name}"
+  if [[ -n "${asset_tag}" ]]
+  then
+    text_block="${text_block}"$'\n'"${asset_tag}"
+  fi
+  if [[ -n "${serial_number}" ]]
+  then
+    text_block="${text_block}"$'\n'"${serial_number}"
+  fi
+
+  "${image_tool}" \
+    -background white \
+    -fill black \
+    -font "${font_name}" \
+    -pointsize 14 \
+    -size "${text_width}x${qr_size}" \
+    -gravity west \
+    caption:"${text_block}" \
+    "${text_image}" || return 1
+
+  "${image_tool}" \
+    "${qr_image}" \
+    "${text_image}" \
+    +append \
+    "${label_image}" || return 1
+
+  rm -f "${qr_source_image}" "${qr_image}" "${text_image}"
+  echo "NetBox mode (${qr_size}px QR)"
+}
+
 preview_label() {
-  if [[ -z "${PRINTLABEL_PREVIEW:-}" ]]
+  local preview_mode="${1:-}"
+
+  if [[ -z "${preview_mode}" ]]
   then
     return 0
+  fi
+
+  if can_preview_with_kitty
+  then
+    preview_label_with_kitty
+    return $?
   fi
 
   if ! command -v display >/dev/null 2>&1
@@ -246,20 +438,38 @@ preview_label() {
     return 0
   fi
 
-  echo "Opening preview. Close the window to continue printing."
+  echo "Opening GUI preview. Close the window to continue printing."
   display "${label_image}"
+  printf 'Print? (y|n) '
+  IFS= read -r -n 1 reply
+  printf '\n'
+  if [[ "${reply}" != "y" ]]
+  then
+    echo "Aborted."
+    return 1
+  fi
 }
 
 main() {
+  local curl_bin
   local image_tool
+  local jq_bin
   local font_name
   local label_text
+  local netbox_device_id=""
+  local netbox_token="${NETBOX_API_TOKEN:-}"
+  local netbox_url="${NETBOX_URL:-}"
+  local netbox_fields=""
   local printer_address
   local script_dir
   local image_file=""
   local image_mode=""
+  local black_mode=""
   local invert_mode=""
+  local preview_mode=""
+  local qr_size="${PRINTLABEL_QR_SIZE:-64}"
   local qr_text=""
+  local explicit_printer_address="${PRINTLABEL_PRINTER:-}"
   local raw_mode=""
   local labelmaker_args=()
   local qr_tool
@@ -272,6 +482,47 @@ main() {
       -h|--help)
         usage
         return 0
+        ;;
+      -p|--printer)
+        if [[ -z "${2:-}" ]]
+        then
+          echo "Missing printer MAC after $1." >&2
+          usage >&2
+          return 2
+        fi
+        explicit_printer_address="$2"
+        shift 2
+        ;;
+      --netbox)
+        if [[ -z "${2:-}" ]]
+        then
+          echo "Missing device ID after --netbox." >&2
+          usage >&2
+          return 2
+        fi
+        netbox_device_id="$2"
+        image_mode=1
+        shift 2
+        ;;
+      --netbox-url)
+        if [[ -z "${2:-}" ]]
+        then
+          echo "Missing URL after --netbox-url." >&2
+          usage >&2
+          return 2
+        fi
+        netbox_url="$2"
+        shift 2
+        ;;
+      --netbox-token)
+        if [[ -z "${2:-}" ]]
+        then
+          echo "Missing token after --netbox-token." >&2
+          usage >&2
+          return 2
+        fi
+        netbox_token="$2"
+        shift 2
         ;;
       --image)
         if [[ -z "${2:-}" ]]
@@ -299,6 +550,24 @@ main() {
         raw_mode=1
         shift
         ;;
+      --preview)
+        preview_mode=1
+        shift
+        ;;
+      --qr-size)
+        if [[ -z "${2:-}" ]]
+        then
+          echo "Missing size after --qr-size." >&2
+          usage >&2
+          return 2
+        fi
+        qr_size="$2"
+        shift 2
+        ;;
+      --black)
+        black_mode=1
+        shift
+        ;;
       --invert)
         invert_mode=1
         shift
@@ -316,13 +585,27 @@ main() {
     return 2
   fi
 
-  if [[ -n "${image_mode}" && $# -ne 1 && $# -ne 0 ]]
+  if [[ -n "${netbox_device_id}" && ( -n "${image_file}" || -n "${qr_text}" ) ]]
+  then
+    echo "Use only one of --image, --qr, or --netbox." >&2
+    usage >&2
+    return 2
+  fi
+
+  if [[ -n "${black_mode}" && -n "${invert_mode}" ]]
+  then
+    echo "Use either --black or --invert, not both." >&2
+    usage >&2
+    return 2
+  fi
+
+  if [[ -n "${image_mode}" && $# -gt 1 ]]
   then
     usage >&2
     return 2
   fi
 
-  if [[ -z "${image_mode}" && $# -ne 2 && $# -ne 1 ]]
+  if [[ -z "${image_mode}" && ( $# -lt 1 || $# -gt 2 ) ]]
   then
     usage >&2
     return 2
@@ -332,10 +615,15 @@ main() {
   then
     if [[ $# -eq 1 ]]
     then
-      printer_address="$1"
-    else
-      printer_address="$(discover_printer_address)" || return 1
+      if [[ -n "${explicit_printer_address}" ]]
+      then
+        echo "Printer address was given twice." >&2
+        usage >&2
+        return 2
+      fi
+      explicit_printer_address="$1"
     fi
+    printer_address="$(discover_printer_address "${explicit_printer_address}")" || return 1
     image_tool="$(find_magick)" || return 1
     if [[ -n "${image_file}" ]]
     then
@@ -356,26 +644,74 @@ main() {
       then
         labelmaker_args+=("-r")
       fi
+      preview_label "${preview_mode}" || return 1
+    elif [[ -n "${netbox_device_id}" ]]
+    then
+      if [[ -z "${netbox_url}" ]]
+      then
+        echo "NetBox mode requires --netbox-url or NETBOX_URL." >&2
+        return 2
+      fi
+      curl_bin="$(find_curl)" || return 1
+      jq_bin="$(find_jq)" || return 1
+      font_name="$(find_font)"
+      qr_tool="$(find_qrencode)" || return 1
+      label_image="$(mktemp --suffix=.png printlabel.XXXXXX)"
+      trap cleanup EXIT
+
+      netbox_fields="$(
+        fetch_netbox_device "${curl_bin}" "${jq_bin}" "${netbox_url}" "${netbox_token}" "${netbox_device_id}"
+      )" || return 1
+
+      IFS=$'\t' read -r device_name asset_tag serial_number <<< "${netbox_fields}"
+      if [[ -z "${device_name}" ]]
+      then
+        echo "NetBox device ${netbox_device_id} has no name." >&2
+        return 1
+      fi
+
+      render_netbox_label \
+        "${image_tool}" \
+        "${qr_tool}" \
+        "${netbox_url}" \
+        "${netbox_device_id}" \
+        "${device_name}" \
+        "${asset_tag}" \
+        "${serial_number}" \
+        "${font_name}" \
+        "${qr_size}" \
+        "${black_mode}" || return 1
+
+      if [[ -n "${invert_mode}" ]]
+      then
+        apply_invert "${image_tool}" "${label_image}" "${label_image}" || return 1
+      fi
+      preview_label "${preview_mode}" || return 1
     else
       qr_tool="$(find_qrencode)" || return 1
       label_image="$(mktemp --suffix=.png printlabel.XXXXXX)"
       trap cleanup EXIT
 
-      render_qr "${qr_text}" "${image_tool}" "${qr_tool}" || return 1
+      render_qr "${qr_text}" "${image_tool}" "${qr_tool}" "${qr_size}" "${black_mode}" || return 1
       if [[ -n "${invert_mode}" ]]
       then
         apply_invert "${image_tool}" "${label_image}" "${label_image}" || return 1
       fi
-      preview_label
+      preview_label "${preview_mode}" || return 1
     fi
   else
     label_text="$1"
     if [[ $# -eq 2 ]]
     then
-      printer_address="$2"
-    else
-      printer_address="$(discover_printer_address)" || return 1
+      if [[ -n "${explicit_printer_address}" ]]
+      then
+        echo "Printer address was given twice." >&2
+        usage >&2
+        return 2
+      fi
+      explicit_printer_address="$2"
     fi
+    printer_address="$(discover_printer_address "${explicit_printer_address}")" || return 1
 
     image_tool="$(find_magick)" || return 1
     font_name="$(find_font)"
@@ -387,7 +723,7 @@ main() {
     then
       apply_invert "${image_tool}" "${label_image}" "${label_image}" || return 1
     fi
-    preview_label
+    preview_label "${preview_mode}" || return 1
   fi
 
   if ! is_bdaddr "${printer_address}"

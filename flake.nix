@@ -42,8 +42,11 @@
             makeWrapper "$out/libexec/printlabel/printlabel" "$out/bin/printlabel" \
               --prefix PATH : ${pkgs.lib.makeBinPath [
                 pkgs.bluez
+                pkgs.curl
                 pkgs.fontconfig
                 pkgs.imagemagick
+                pkgs.jq
+                pkgs.kitty
                 pkgs.qrencode
                 python
               ]} \
@@ -74,8 +77,11 @@
         devShells.default = pkgs.mkShell {
           packages = [
             pkgs.bluez
+            pkgs.curl
             pkgs.fontconfig
             pkgs.imagemagick
+            pkgs.jq
+            pkgs.kitty
             pkgs.qrencode
             pkgs.shellcheck
             python
