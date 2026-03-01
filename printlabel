@@ -360,7 +360,9 @@ render_netbox_label() {
   local qr_image
   local text_image
   local text_block=""
-  local text_width=320
+  local text_width
+  local qr_gap=4
+  local text_padding=8
 
   qr_source_image="$(mktemp --suffix=.png printlabel-qr.XXXXXX)"
   qr_image="$(mktemp --suffix=.png printlabel-qr-rendered.XXXXXX)"
@@ -398,6 +400,26 @@ render_netbox_label() {
     text_block="${text_block}"$'\n'"${serial_number}"
   fi
 
+  text_width="$(
+    "${image_tool}" \
+      -background white \
+      -fill black \
+      -font "${font_name}" \
+      -pointsize 14 \
+      -size "x${qr_size}" \
+      caption:"${text_block}" \
+      -format '%w' \
+      info:
+  )" || return 1
+
+  if [[ ! "${text_width}" =~ ^[0-9]+$ ]]
+  then
+    echo "Failed to determine NetBox text width." >&2
+    return 1
+  fi
+
+  text_width=$((text_width + text_padding))
+
   "${image_tool}" \
     -background white \
     -fill black \
@@ -406,6 +428,8 @@ render_netbox_label() {
     -size "${text_width}x${qr_size}" \
     -gravity west \
     caption:"${text_block}" \
+    -bordercolor white \
+    -border "${qr_gap}x0" \
     "${text_image}" || return 1
 
   "${image_tool}" \
