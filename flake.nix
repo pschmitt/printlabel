@@ -13,6 +13,18 @@
           inherit system;
         };
 
+        version =
+          let
+            rev =
+              if self ? shortRev then
+                self.shortRev
+              else if self ? dirtyShortRev then
+                self.dirtyShortRev
+              else
+                "unknown-dirty";
+          in
+          "${pkgs.lib.substring 0 8 self.lastModifiedDate}-${rev}";
+
         python = pkgs.python3.withPackages (ps: with ps; [
           pillow
           pybluez
@@ -20,7 +32,7 @@
 
         printlabel = pkgs.stdenvNoCC.mkDerivation {
           pname = "printlabel";
-          version = "0.1.0";
+          inherit version;
           src = ./.;
 
           nativeBuildInputs = [
@@ -51,6 +63,7 @@
                 python
               ]} \
               --set PYTHONPATH "$out/libexec/printlabel" \
+              --set PRINTLABEL_VERSION "${version}" \
               --set-default PRINTLABEL_QR_SIZE 64 \
               --set-default PYTHONNOUSERSITE 1
 

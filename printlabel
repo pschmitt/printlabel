@@ -10,6 +10,7 @@ Usage:
 
 Options:
   -h, --help           Show this help message
+  -v, --version        Show version information
   -p, --printer MAC    Use the given printer MAC address
       --image PATH     Print an existing image file
       --qr TEXT        Generate and print a QR code
@@ -29,6 +30,10 @@ Examples:
   $(basename "$0") --netbox 123 --netbox-url https://netbox.example.com
   $(basename "$0") --qr 'https://example.com' --black
 EOF
+}
+
+print_version() {
+  printf '%s\n' "${PRINTLABEL_VERSION:-dev}"
 }
 
 cleanup() {
@@ -505,6 +510,10 @@ main() {
     case "$1" in
       -h|--help)
         usage
+        return 0
+        ;;
+      -v|--version)
+        print_version
         return 0
         ;;
       -p|--printer)
