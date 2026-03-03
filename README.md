@@ -64,6 +64,7 @@ NetBox labels:
 ./printlabel --netbox '109PNEB0E740'
 ./printlabel --netbox
 ./printlabel --netbox Schmutzi --preview
+./printlabel --netbox Schmutzi --simple
 ./printlabel --netbox 123 --netbox-url https://netbox.example.com
 ```
 
@@ -73,6 +74,7 @@ NetBox labels:
 
 - `--netbox [QUERY]` accepts an id, name, serial, or asset tag.
 - `--netbox` with no argument opens `fzf` over all devices.
+- `--simple` in NetBox mode prints only the QR code and asset tag.
 - Exact matches are resolved first; broader NetBox search is used as fallback.
 - If multiple devices match, `fzf` is used for selection.
 - The `fzf` list shows only device names; the preview pane shows device details.
@@ -86,6 +88,7 @@ NetBox labels:
 - `--raw`: skip preprocessing for `--image`
 - `--invert`: invert black and white
 - `--netbox [QUERY]`: print a NetBox device label
+- `--simple`: in NetBox mode, print only the QR code and asset tag
 - `--netbox-url URL`: override `NETBOX_URL`
 - `--netbox-token TOKEN`: override `NETBOX_API_TOKEN`
 

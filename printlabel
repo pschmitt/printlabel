@@ -15,6 +15,7 @@ Options:
       --image PATH     Print an existing image file
       --qr TEXT        Generate and print a QR code
       --netbox [QUERY] Resolve a NetBox device by id, name, serial, or asset tag
+      --simple         In NetBox mode, print only QR code and asset tag
       --netbox-url URL NetBox base URL, overrides NETBOX_URL
       --netbox-token T NetBox API token, overrides NETBOX_API_TOKEN
       --qr-size PX     Set QR size in pixels before padding
@@ -30,6 +31,7 @@ Examples:
   $(basename "$0") --netbox 123 --netbox-url https://netbox.example.com
   $(basename "$0") --netbox Schmutzi
   $(basename "$0") --netbox
+  $(basename "$0") --netbox 123 --simple
   $(basename "$0") --qr 'https://example.com' --black
 EOF
 }
@@ -121,6 +123,17 @@ find_fzf() {
 
   echo "fzf is required to choose between multiple NetBox devices." >&2
   return 1
+}
+
+normalize_label_line() {
+  local text="$1"
+
+  text="${text//$'\r'/ }"
+  text="${text//$'\n'/ }"
+  text="${text//$'\t'/ }"
+  text="$(awk '{$1=$1; print}' <<< "${text}")"
+
+  printf '%s\n' "${text}"
 }
 
 is_bdaddr() {
@@ -503,10 +516,15 @@ render_netbox_label() {
   local font_name="$8"
   local qr_size="$9"
   local black_mode="${10}"
+  local simple_mode="${11}"
   local qr_source_image
   local qr_image
   local text_image
   local text_block=""
+  local text_dimensions
+  local text_height
+  local text_pointsize=14
+  local simple_text_pointsize=20
   local text_width
   local qr_gap=4
   local text_padding=8
@@ -537,31 +555,61 @@ render_netbox_label() {
     apply_invert "${image_tool}" "${qr_image}" "${qr_image}" || return 1
   fi
 
-  text_block="${device_name}"
-  if [[ -n "${asset_tag}" ]]
+  asset_tag="$(normalize_label_line "${asset_tag}")"
+  if [[ -n "${simple_mode}" ]]
   then
-    text_block="${text_block}"$'\n'"${asset_tag}"
-  fi
-  if [[ -n "${serial_number}" ]]
-  then
-    text_block="${text_block}"$'\n'"${serial_number}"
+    text_pointsize="${simple_text_pointsize}"
+    text_block="${asset_tag}"
+  else
+    device_name="$(normalize_label_line "${device_name}")"
+    serial_number="$(normalize_label_line "${serial_number}")"
+
+    text_block="${device_name}"
+    if [[ -n "${asset_tag}" ]]
+    then
+      text_block="${text_block}"$'\n'"${asset_tag}"
+    fi
+    if [[ -n "${serial_number}" ]]
+    then
+      text_block="${text_block}"$'\n'"${serial_number}"
+    fi
   fi
 
-  text_width="$(
-    "${image_tool}" \
-      -background white \
-      -fill black \
-      -font "${font_name}" \
-      -pointsize 14 \
-      -size "x${qr_size}" \
-      caption:"${text_block}" \
-      -format '%w' \
-      info:
-  )" || return 1
+  while [[ "${text_pointsize}" -ge 8 ]]
+  do
+    text_dimensions="$(
+      "${image_tool}" \
+        -background white \
+        -fill black \
+        -font "${font_name}" \
+        -pointsize "${text_pointsize}" \
+        "label:${text_block}" \
+        -format '%w %h' \
+        info:
+    )" || return 1
 
-  if [[ ! "${text_width}" =~ ^[0-9]+$ ]]
+    read -r text_width text_height <<< "${text_dimensions}"
+
+    if [[ "${text_width}" =~ ^[0-9]+$ && "${text_height}" =~ ^[0-9]+$ ]]
+    then
+      if (( text_height <= qr_size ))
+      then
+        break
+      fi
+    fi
+
+    text_pointsize=$((text_pointsize - 1))
+  done
+
+  if [[ ! "${text_width}" =~ ^[0-9]+$ || ! "${text_height}" =~ ^[0-9]+$ ]]
   then
-    echo "Failed to determine NetBox text width." >&2
+    echo "Failed to determine NetBox text dimensions." >&2
+    return 1
+  fi
+
+  if (( text_height > qr_size ))
+  then
+    echo "NetBox text block is too tall to fit on the label." >&2
     return 1
   fi
 
@@ -571,12 +619,12 @@ render_netbox_label() {
     -background white \
     -fill black \
     -font "${font_name}" \
-    -pointsize 14 \
-    -size "${text_width}x${qr_size}" \
+    -pointsize "${text_pointsize}" \
     -gravity west \
-    caption:"${text_block}" \
+    "label:${text_block}" \
     -bordercolor white \
     -border "${qr_gap}x0" \
+    -extent "${text_width}x${qr_size}" \
     "${text_image}" || return 1
 
   "${image_tool}" \
@@ -644,6 +692,7 @@ main() {
   local qr_text=""
   local explicit_printer_address="${PRINTLABEL_PRINTER:-}"
   local raw_mode=""
+  local simple_mode=""
   local labelmaker_args=()
   local qr_tool
   local device_name=""
@@ -704,6 +753,10 @@ main() {
         fi
         netbox_token="$2"
         shift 2
+        ;;
+      --simple)
+        simple_mode=1
+        shift
         ;;
       --image)
         if [[ -z "${2:-}" ]]
@@ -769,6 +822,13 @@ main() {
   if [[ -n "${netbox_mode}" && ( -n "${image_file}" || -n "${qr_text}" ) ]]
   then
     echo "Use only one of --image, --qr, or --netbox." >&2
+    usage >&2
+    return 2
+  fi
+
+  if [[ -n "${simple_mode}" && -z "${netbox_mode}" ]]
+  then
+    echo "--simple can only be used with --netbox." >&2
     usage >&2
     return 2
   fi
@@ -849,7 +909,13 @@ main() {
       asset_tag="$("${jq_bin}" -r '.asset_tag // ""' <<< "${netbox_device_json}")" || return 1
       serial_number="$("${jq_bin}" -r '.serial // ""' <<< "${netbox_device_json}")" || return 1
 
-      if [[ -z "${device_name}" ]]
+      if [[ -n "${simple_mode}" && -z "${asset_tag}" ]]
+      then
+        echo "NetBox device ${netbox_device_id} has no asset tag for --simple mode." >&2
+        return 1
+      fi
+
+      if [[ -z "${simple_mode}" && -z "${device_name}" ]]
       then
         echo "NetBox device ${netbox_device_id} has no name." >&2
         return 1
@@ -865,7 +931,8 @@ main() {
         "${serial_number}" \
         "${font_name}" \
         "${qr_size}" \
-        "${black_mode}" || return 1
+        "${black_mode}" \
+        "${simple_mode}" || return 1
 
       if [[ -n "${invert_mode}" ]]
       then
