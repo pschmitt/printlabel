@@ -48,8 +48,10 @@ export NETBOX_API_TOKEN='...'
 ```sh
 ./printlabel 'HELLO'
 ./printlabel --printer 98:6E:E8:47:C9:A3 'HELLO'
+./printlabel --count 3 'HELLO'
 ./printlabel --image label.png
 ./printlabel --qr 'https://example.com'
+./printlabel --qr 'https://example.com' test1234
 ./printlabel --qr 'https://example.com' --qr-size 64
 ./printlabel --invert 'HELLO'
 ./printlabel --preview 'HELLO'
@@ -82,6 +84,8 @@ NetBox labels:
 ## Flags
 
 - `--printer MAC`: use a specific printer
+- `--count N`: print the same label `N` times
+- Positional arguments are treated as label text (for text mode, or as right-side text in `--qr` mode).
 - `--preview`: preview first, then ask before printing
 - `--qr-size PX`: QR size in pixels before padding
 - `--black`: invert QR codes for black tape; in NetBox mode only the QR block is inverted

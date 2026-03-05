@@ -5,15 +5,16 @@ usage() {
 Usage:
   $(basename "$0") [options] TEXT
   $(basename "$0") [options] --image PATH
-  $(basename "$0") [options] --qr TEXT
+  $(basename "$0") [options] --qr TEXT [LABEL_TEXT ...]
   $(basename "$0") [options] --netbox [QUERY]
 
 Options:
   -h, --help           Show this help message
   -v, --version        Show version information
   -p, --printer MAC    Use the given printer MAC address
+  -c, --count N        Print the same label N times
       --image PATH     Print an existing image file
-      --qr TEXT        Generate and print a QR code
+      --qr TEXT        Generate and print a QR code (optionally with right-side label text)
       --netbox [QUERY] Resolve a NetBox device by id, name, serial, or asset tag
       --simple         In NetBox mode, print only QR code and asset tag
       --netbox-url URL NetBox base URL, overrides NETBOX_URL
@@ -27,7 +28,9 @@ Options:
 Examples:
   $(basename "$0") 'HELLO'
   $(basename "$0") --printer 98:6E:E8:47:C9:A3 --image label.png
+  $(basename "$0") --count 3 'HELLO'
   $(basename "$0") --qr 'https://example.com' --preview
+  $(basename "$0") --qr 'https://example.com' test1234
   $(basename "$0") --netbox 123 --netbox-url https://netbox.example.com
   $(basename "$0") --netbox Schmutzi
   $(basename "$0") --netbox
@@ -341,6 +344,119 @@ render_qr() {
 
   rm -f "${qr_source_image}"
   echo "QR mode (${qr_size}px)"
+}
+
+render_qr_with_text() {
+  local qr_text="$1"
+  local text_block="$2"
+  local image_tool="$3"
+  local qr_tool="$4"
+  local font_name="$5"
+  local qr_size="$6"
+  local black_mode="$7"
+  local qr_source_image
+  local qr_image
+  local text_image
+  local text_dimensions
+  local text_height
+  local text_pointsize=20
+  local text_width
+  local qr_gap=4
+  local text_padding=8
+
+  if [[ ! "${qr_size}" =~ ^[0-9]+$ ]] || [[ "${qr_size}" -le 0 ]]
+  then
+    echo "QR size must be a positive integer." >&2
+    return 1
+  fi
+
+  qr_source_image="$(mktemp --suffix=.png printlabel-qr.XXXXXX)"
+  qr_image="$(mktemp --suffix=.png printlabel-qr-rendered.XXXXXX)"
+  text_image="$(mktemp --suffix=.png printlabel-text.XXXXXX)"
+
+  "${qr_tool}" \
+    --level=M \
+    --margin=1 \
+    --size=1 \
+    --type=PNG \
+    --output="${qr_source_image}" \
+    "${qr_text}" || return 1
+
+  "${image_tool}" \
+    "${qr_source_image}" \
+    -filter point \
+    -resize "${qr_size}x${qr_size}" \
+    -gravity center \
+    -background white \
+    -extent "${qr_size}x${qr_size}" \
+    "${qr_image}" || return 1
+
+  if [[ -n "${black_mode}" ]]
+  then
+    apply_invert "${image_tool}" "${qr_image}" "${qr_image}" || return 1
+  fi
+
+  text_block="$(normalize_label_line "${text_block}")"
+  while [[ "${text_pointsize}" -ge 8 ]]
+  do
+    text_dimensions="$(
+      "${image_tool}" \
+        -background white \
+        -fill black \
+        -font "${font_name}" \
+        -pointsize "${text_pointsize}" \
+        "label:${text_block}" \
+        -format '%w %h' \
+        info:
+    )" || return 1
+
+    read -r text_width text_height <<< "${text_dimensions}"
+
+    if [[ "${text_width}" =~ ^[0-9]+$ && "${text_height}" =~ ^[0-9]+$ ]]
+    then
+      if (( text_height <= qr_size ))
+      then
+        break
+      fi
+    fi
+
+    text_pointsize=$((text_pointsize - 1))
+  done
+
+  if [[ ! "${text_width}" =~ ^[0-9]+$ || ! "${text_height}" =~ ^[0-9]+$ ]]
+  then
+    echo "Failed to determine QR text dimensions." >&2
+    return 1
+  fi
+
+  if (( text_height > qr_size ))
+  then
+    echo "QR text block is too tall to fit on the label." >&2
+    return 1
+  fi
+
+  text_width=$((text_width + text_padding))
+
+  "${image_tool}" \
+    -background white \
+    -fill black \
+    -font "${font_name}" \
+    -pointsize "${text_pointsize}" \
+    -gravity west \
+    "label:${text_block}" \
+    -bordercolor white \
+    -border "${qr_gap}x0" \
+    -extent "${text_width}x${qr_size}" \
+    "${text_image}" || return 1
+
+  "${image_tool}" \
+    "${qr_image}" \
+    "${text_image}" \
+    +append \
+    "${label_image}" || return 1
+
+  rm -f "${qr_source_image}" "${qr_image}" "${text_image}"
+  echo "QR + text mode (${qr_size}px QR)"
 }
 
 fetch_netbox_devices() {
@@ -688,16 +804,20 @@ main() {
   local black_mode=""
   local invert_mode=""
   local preview_mode=""
+  local count="1"
   local qr_size="${PRINTLABEL_QR_SIZE:-64}"
   local qr_text=""
   local explicit_printer_address="${PRINTLABEL_PRINTER:-}"
   local raw_mode=""
   local simple_mode=""
   local labelmaker_args=()
+  local -a positional_args=()
   local qr_tool
+  local qr_label_text=""
   local device_name=""
   local asset_tag=""
   local serial_number=""
+  local print_index
 
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -722,10 +842,20 @@ main() {
         explicit_printer_address="$2"
         shift 2
         ;;
+      -c|--count)
+        if [[ -z "${2:-}" ]]
+        then
+          echo "Missing count after $1." >&2
+          usage >&2
+          return 2
+        fi
+        count="$2"
+        shift 2
+        ;;
       --netbox)
         netbox_mode=1
         image_mode=1
-        if [[ -n "${2:-}" ]] && [[ ! "${2}" == -* ]] && ! is_bdaddr "${2}"
+        if [[ -n "${2:-}" ]] && [[ ! "${2}" == -* ]]
         then
           netbox_query="$2"
           shift 2
@@ -812,6 +942,8 @@ main() {
     esac
   done
 
+  positional_args=("$@")
+
   if [[ -n "${image_file}" && -n "${qr_text}" ]]
   then
     echo "Use either --image or --qr, not both." >&2
@@ -840,13 +972,32 @@ main() {
     return 2
   fi
 
-  if [[ -n "${image_mode}" && $# -gt 1 ]]
+  if [[ ! "${count}" =~ ^[0-9]+$ ]] || [[ "${count}" -le 0 ]]
+  then
+    echo "Count must be a positive integer." >&2
+    usage >&2
+    return 2
+  fi
+
+  if [[ -n "${image_mode}" && -n "${netbox_mode}" && ${#positional_args[@]} -gt 0 ]]
   then
     usage >&2
     return 2
   fi
 
-  if [[ -z "${image_mode}" && ( $# -lt 1 || $# -gt 2 ) ]]
+  if [[ -n "${image_mode}" && -n "${image_file}" && ${#positional_args[@]} -gt 0 ]]
+  then
+    usage >&2
+    return 2
+  fi
+
+  if [[ -n "${image_mode}" && ${#positional_args[@]} -gt 0 && -z "${qr_text}" ]]
+  then
+    usage >&2
+    return 2
+  fi
+
+  if [[ -z "${image_mode}" && ${#positional_args[@]} -lt 1 ]]
   then
     usage >&2
     return 2
@@ -854,16 +1005,6 @@ main() {
 
   if [[ -n "${image_mode}" ]]
   then
-    if [[ $# -eq 1 ]]
-    then
-      if [[ -n "${explicit_printer_address}" ]]
-      then
-        echo "Printer address was given twice." >&2
-        usage >&2
-        return 2
-      fi
-      explicit_printer_address="$1"
-    fi
     printer_address="$(discover_printer_address "${explicit_printer_address}")" || return 1
     image_tool="$(find_magick)" || return 1
     if [[ -n "${image_file}" ]]
@@ -941,10 +1082,24 @@ main() {
       preview_label "${preview_mode}" || return 1
     else
       qr_tool="$(find_qrencode)" || return 1
+      font_name="$(find_font)"
       label_image="$(mktemp --suffix=.png printlabel.XXXXXX)"
       trap cleanup EXIT
 
-      render_qr "${qr_text}" "${image_tool}" "${qr_tool}" "${qr_size}" "${black_mode}" || return 1
+      if [[ ${#positional_args[@]} -gt 0 ]]
+      then
+        qr_label_text="${positional_args[*]}"
+        render_qr_with_text \
+          "${qr_text}" \
+          "${qr_label_text}" \
+          "${image_tool}" \
+          "${qr_tool}" \
+          "${font_name}" \
+          "${qr_size}" \
+          "${black_mode}" || return 1
+      else
+        render_qr "${qr_text}" "${image_tool}" "${qr_tool}" "${qr_size}" "${black_mode}" || return 1
+      fi
       if [[ -n "${invert_mode}" ]]
       then
         apply_invert "${image_tool}" "${label_image}" "${label_image}" || return 1
@@ -952,17 +1107,7 @@ main() {
       preview_label "${preview_mode}" || return 1
     fi
   else
-    label_text="$1"
-    if [[ $# -eq 2 ]]
-    then
-      if [[ -n "${explicit_printer_address}" ]]
-      then
-        echo "Printer address was given twice." >&2
-        usage >&2
-        return 2
-      fi
-      explicit_printer_address="$2"
-    fi
+    label_text="${positional_args[*]}"
     printer_address="$(discover_printer_address "${explicit_printer_address}")" || return 1
 
     image_tool="$(find_magick)" || return 1
@@ -987,7 +1132,12 @@ main() {
   echo "Using printer: ${printer_address}"
   prepare_printer_connection "${printer_address}"
 
-  python3 "${script_dir}/labelmaker.py" -i "${label_image}" "${labelmaker_args[@]}" "${printer_address}"
+  print_index=1
+  while [[ "${print_index}" -le "${count}" ]]
+  do
+    python3 "${script_dir}/labelmaker.py" -i "${label_image}" "${labelmaker_args[@]}" "${printer_address}" || return 1
+    print_index=$((print_index + 1))
+  done
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]
