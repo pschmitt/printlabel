@@ -43,6 +43,156 @@ print_version() {
   printf '%s\n' "${PRINTLABEL_VERSION:-dev}"
 }
 
+PRINTLABEL_COLOR_STDOUT=""
+PRINTLABEL_COLOR_STDERR=""
+
+supports_color() {
+  local fd="${1:-1}"
+
+  if [[ "${fd}" -eq 2 ]]
+  then
+    [[ -n "${PRINTLABEL_COLOR_STDERR:-}" ]]
+    return $?
+  fi
+
+  [[ -n "${PRINTLABEL_COLOR_STDOUT:-}" ]]
+}
+
+init_color_support() {
+  if [[ -t 1 ]]
+  then
+    PRINTLABEL_COLOR_STDOUT=1
+  fi
+
+  if [[ -t 2 ]]
+  then
+    PRINTLABEL_COLOR_STDERR=1
+  fi
+}
+
+color_code() {
+  local name="$1"
+
+  case "${name}" in
+    red)
+      printf '%s' '31'
+      ;;
+    green)
+      printf '%s' '32'
+      ;;
+    yellow)
+      printf '%s' '33'
+      ;;
+    blue)
+      printf '%s' '34'
+      ;;
+    cyan)
+      printf '%s' '36'
+      ;;
+    gray)
+      printf '%s' '90'
+      ;;
+    bold)
+      printf '%s' '1'
+      ;;
+    strikethrough)
+      printf '%s' '9'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+colorize() {
+  local name="$1"
+  local text="$2"
+  local fd="${3:-1}"
+  local code
+
+  if ! supports_color "${fd}"
+  then
+    printf '%s' "${text}"
+    return 0
+  fi
+
+  code="$(color_code "${name}")" || {
+    printf '%s' "${text}"
+    return 0
+  }
+
+  printf '\033[%sm%s\033[0m' "${code}" "${text}"
+}
+
+colorize_multi() {
+  local style_names="$1"
+  local text="$2"
+  local fd="${3:-1}"
+  local style_name
+  local code
+  local codes=()
+
+  if ! supports_color "${fd}"
+  then
+    printf '%s' "${text}"
+    return 0
+  fi
+
+  for style_name in ${style_names}
+  do
+    code="$(color_code "${style_name}")" || continue
+    codes+=("${code}")
+  done
+
+  if [[ "${#codes[@]}" -eq 0 ]]
+  then
+    printf '%s' "${text}"
+    return 0
+  fi
+
+  printf '\033[%sm%s\033[0m' "$(IFS=';'; printf '%s' "${codes[*]}")" "${text}"
+}
+
+netbox_value_color() {
+  local key="$1"
+
+  case "${key}" in
+    Type)
+      printf '%s' 'cyan'
+      ;;
+    ID|Asset\ tag|Serial)
+      printf '%s' 'yellow'
+      ;;
+    Name|Manufacturer|Device\ type|Role|Site|Location)
+      printf '%s' 'green'
+      ;;
+    URL)
+      printf '%s' 'blue'
+      ;;
+    *)
+      printf '%s' 'cyan'
+      ;;
+  esac
+}
+
+log_info() {
+  local message="$1"
+
+  printf '%s %s\n' "$(colorize blue 'INF' 2)" "${message}" >&2
+}
+
+log_warn() {
+  local message="$1"
+
+  printf '%s %s\n' "$(colorize yellow 'WRN' 2)" "${message}" >&2
+}
+
+log_error() {
+  local message="$1"
+
+  printf '%s %s\n' "$(colorize red 'ERR' 2)" "${message}" >&2
+}
+
 cleanup() {
   if [[ -n "${label_image:-}" && -f "${label_image}" ]]
   then
@@ -63,7 +213,7 @@ find_magick() {
     return 0
   fi
 
-  echo "ImageMagick is required but neither 'magick' nor 'convert' was found." >&2
+  log_error "ImageMagick is required but neither 'magick' nor 'convert' was found."
   return 1
 }
 
@@ -91,7 +241,7 @@ find_qrencode() {
     return 0
   fi
 
-  echo "qrencode is required for --qr mode." >&2
+  log_error "qrencode is required for --qr mode."
   return 1
 }
 
@@ -102,7 +252,7 @@ find_jq() {
     return 0
   fi
 
-  echo "jq is required for --netbox mode." >&2
+  log_error "jq is required for --netbox mode."
   return 1
 }
 
@@ -113,7 +263,7 @@ find_nbx() {
     return 0
   fi
 
-  echo "nbx is required for --netbox mode." >&2
+  log_error "nbx is required for --netbox mode."
   return 1
 }
 
@@ -124,7 +274,7 @@ find_fzf() {
     return 0
   fi
 
-  echo "fzf is required to choose between multiple NetBox devices." >&2
+  log_error "fzf is required to choose between multiple NetBox devices."
   return 1
 }
 
@@ -260,7 +410,9 @@ can_preview_with_kitty() {
 preview_label_with_kitty() {
   local reply
 
-  kitten icat --stdin=no --transfer-mode=detect "${label_image}" || return 1
+  printf '\n'
+  printf '%s\n' "$(colorize_multi 'bold cyan' 'Label preview' 1)"
+  kitten icat --stdin=no --transfer-mode=detect --align=left "${label_image}" || return 1
   printf '\nPrint? (y|n) '
   IFS= read -r -n 1 reply
   printf '\n'
@@ -627,9 +779,9 @@ select_netbox_object() {
   then
     if [[ -n "${netbox_query}" ]]
     then
-      echo "No NetBox device or rack matched '${netbox_query}'." >&2
+      log_error "No NetBox device or rack matched '${netbox_query}'."
     else
-      echo "No NetBox devices or racks found." >&2
+      log_error "No NetBox devices or racks found."
     fi
     return 1
   fi
@@ -873,29 +1025,62 @@ render_netbox_label() {
     "${label_image}" || return 1
 
   rm -f "${qr_source_image}" "${qr_image}" "${text_image}"
-  echo "NetBox mode (${qr_size}px QR)"
 }
 
 print_netbox_summary() {
   local jq_bin="$1"
   local netbox_object_json="$2"
+  local summary_lines
+  local key
+  local value
+  local value_color
+  local width
 
-  "${jq_bin}" -r '
+  width="$("${jq_bin}" -r '
     [
-      "NetBox object:",
-      "  Type: " + (.printlabel_kind // "unknown"),
-      "  ID: " + ((.id // "") | tostring),
-      "  Name: " + (.name // ""),
-      "  Manufacturer: " + (.device_type.manufacturer.name // ""),
-      "  Device type: " + (.device_type.model // ""),
-      "  Asset tag: " + (.asset_tag // ""),
-      "  Serial: " + (.serial // ""),
-      "  Role: " + (.role.name // ""),
-      "  Site: " + (.site.name // ""),
-      "  Location: " + (.location.name // ""),
-      "  URL: " + (.display_url // "")
+      "Type",
+      "ID",
+      "Name",
+      "Manufacturer",
+      "Device type",
+      "Asset tag",
+      "Serial",
+      "Role",
+      "Site",
+      "Location",
+      "URL"
+    ] | map(length) | max
+  ' <<< "${netbox_object_json}")" || return 1
+
+  summary_lines="$("${jq_bin}" -r '
+    [
+      "Type\t" + (.printlabel_kind // "unknown"),
+      "ID\t" + ((.id // "") | tostring),
+      "Name\t" + (.name // ""),
+      "Manufacturer\t" + (.device_type.manufacturer.name // ""),
+      "Device type\t" + (.device_type.model // ""),
+      "Asset tag\t" + (.asset_tag // ""),
+      "Serial\t" + (.serial // ""),
+      "Role\t" + (.role.name // ""),
+      "Site\t" + (.site.name // ""),
+      "Location\t" + (.location.name // ""),
+      "URL\t" + (.display_url // "")
     ] | join("\n")
-  ' <<< "${netbox_object_json}"
+  ' <<< "${netbox_object_json}")" || return 1
+
+  while IFS=$'\t' read -r key value
+  do
+    if [[ -z "${value}" ]]
+    then
+      value="$(colorize_multi 'gray strikethrough' 'N/A' 1)"
+    else
+      value_color="$(netbox_value_color "${key}")"
+      value="$(colorize "${value_color}" "${value}" 1)"
+    fi
+    printf '%s  %s\n' \
+      "$(colorize_multi 'bold cyan' "$(printf '%-*s' "${width}" "${key}")" 1)" \
+      "${value}"
+  done <<< "${summary_lines}"
 }
 
 preview_label() {
@@ -914,18 +1099,18 @@ preview_label() {
 
   if ! command -v display >/dev/null 2>&1
   then
-    echo "Preview requested but 'display' is not installed. Continuing without preview." >&2
+    log_warn "Preview requested but 'display' is not installed. Continuing without preview."
     return 0
   fi
 
-  echo "Opening GUI preview. Close the window to continue printing."
+  log_info "Opening GUI preview. Close the window to continue printing."
   display "${label_image}"
   printf 'Print? (y|n) '
   IFS= read -r -n 1 reply
   printf '\n'
   if [[ "${reply}" != "y" ]]
   then
-    echo "Aborted."
+    log_warn "Aborted."
     return 1
   fi
 }
@@ -967,6 +1152,7 @@ main() {
   local print_index
 
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  init_color_support
 
   while [[ -n "${1:-}" ]]
   do
@@ -1285,7 +1471,7 @@ main() {
     return 2
   fi
 
-  echo "Using printer: ${printer_address}"
+  log_info "Using printer: ${printer_address}"
   prepare_printer_connection "${printer_address}"
 
   print_index=1
