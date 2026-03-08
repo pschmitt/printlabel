@@ -15,7 +15,7 @@ Options:
   -c, --count N        Print the same label N times
       --image PATH     Print an existing image file
       --qr TEXT        Generate and print a QR code (optionally with right-side label text)
-      --netbox [QUERY] Resolve a NetBox device by id, name, serial, or asset tag
+      --netbox [QUERY] Resolve a NetBox device or rack by id, name, serial, or asset tag
       --simple         In NetBox mode, print only QR code and asset tag
       --netbox-url URL NetBox base URL, overrides NETBOX_URL
       --netbox-token T NetBox API token, overrides NETBOX_API_TOKEN
@@ -459,31 +459,84 @@ render_qr_with_text() {
   echo "QR + text mode (${qr_size}px QR)"
 }
 
-fetch_netbox_devices() {
+fetch_netbox_objects() {
   local nbx_bin="$1"
   local jq_bin="$2"
   local netbox_url="$3"
   local netbox_token="$4"
   local netbox_query="${5:-}"
   local response
+  local devices_response
+  local racks_response
   local exact_matches
   local search_matches
+  local devices_file
+  local racks_file
+
+  devices_file="$(mktemp printlabel-netbox-devices.XXXXXX.json)" || return 1
+  racks_file="$(mktemp printlabel-netbox-racks.XXXXXX.json)" || {
+    rm -f "${devices_file}"
+    return 1
+  }
 
   if [[ -z "${netbox_query}" ]]
   then
-    NETBOX_URL="${netbox_url}" \
-      NETBOX_API_TOKEN="${netbox_token}" \
-      "${nbx_bin}" -j devices
+    devices_response="$(
+      NETBOX_URL="${netbox_url}" \
+        NETBOX_API_TOKEN="${netbox_token}" \
+        "${nbx_bin}" -j devices
+    )" || return 1
+    racks_response="$(
+      NETBOX_URL="${netbox_url}" \
+        NETBOX_API_TOKEN="${netbox_token}" \
+        "${nbx_bin}" -j racks
+    )" || return 1
+
+    printf '%s\n' "${devices_response}" > "${devices_file}"
+    printf '%s\n' "${racks_response}" > "${racks_file}"
+
+    # shellcheck disable=SC2016
+    "${jq_bin}" -s '
+      [
+        (.[0][] | . + {printlabel_kind: "device"}),
+        (.[1][] | . + {printlabel_kind: "rack"})
+      ]
+      | unique_by(.printlabel_kind, .id)
+      | sort_by(.name // "", .asset_tag // "", .serial // "", .id)
+    ' "${devices_file}" "${racks_file}"
+    rm -f "${devices_file}" "${racks_file}"
     return $?
   fi
 
   if [[ "${netbox_query}" =~ ^[0-9]+$ ]]
   then
-    response="$(
+    devices_response="$(
       NETBOX_URL="${netbox_url}" \
         NETBOX_API_TOKEN="${netbox_token}" \
         "${nbx_bin}" -j devices "id=${netbox_query}"
     )" || return 1
+    racks_response="$(
+      NETBOX_URL="${netbox_url}" \
+        NETBOX_API_TOKEN="${netbox_token}" \
+        "${nbx_bin}" -j racks "id=${netbox_query}"
+    )" || return 1
+
+    printf '%s\n' "${devices_response}" > "${devices_file}"
+    printf '%s\n' "${racks_response}" > "${racks_file}"
+
+    response="$(
+      # shellcheck disable=SC2016
+      "${jq_bin}" -s '
+        [
+          (.[0][] | . + {printlabel_kind: "device"}),
+          (.[1][] | . + {printlabel_kind: "rack"})
+        ]
+        | unique_by(.printlabel_kind, .id)
+        | sort_by(.name // "", .asset_tag // "", .serial // "", .id)
+      ' "${devices_file}" "${racks_file}"
+    )" || return 1
+
+    rm -f "${devices_file}" "${racks_file}"
 
     if [[ "$("${jq_bin}" -r 'length' <<< "${response}")" -gt 0 ]]
     then
@@ -492,11 +545,31 @@ fetch_netbox_devices() {
     fi
   fi
 
-  search_matches="$(
+  devices_response="$(
     NETBOX_URL="${netbox_url}" \
-    NETBOX_API_TOKEN="${netbox_token}" \
-    "${nbx_bin}" -j devices "q=${netbox_query}"
+      NETBOX_API_TOKEN="${netbox_token}" \
+      "${nbx_bin}" -j devices "q=${netbox_query}"
   )" || return 1
+  racks_response="$(
+    NETBOX_URL="${netbox_url}" \
+      NETBOX_API_TOKEN="${netbox_token}" \
+      "${nbx_bin}" -j racks "q=${netbox_query}"
+  )" || return 1
+
+  printf '%s\n' "${devices_response}" > "${devices_file}"
+  printf '%s\n' "${racks_response}" > "${racks_file}"
+
+  search_matches="$(
+    # shellcheck disable=SC2016
+    "${jq_bin}" -s '
+      [
+        (.[0][] | . + {printlabel_kind: "device"}),
+        (.[1][] | . + {printlabel_kind: "rack"})
+      ]
+    ' "${devices_file}" "${racks_file}"
+  )" || return 1
+
+  rm -f "${devices_file}" "${racks_file}"
 
   exact_matches="$(
     # shellcheck disable=SC2016
@@ -508,7 +581,7 @@ fetch_netbox_devices() {
           or (.asset_tag // "" | ascii_downcase) == ($query | ascii_downcase)
         )
       )
-      | unique_by(.id)
+      | unique_by(.printlabel_kind, .id)
       | sort_by(.name // "", .asset_tag // "", .serial // "", .id)
     ' <<< "${search_matches}"
   )" || return 1
@@ -520,67 +593,109 @@ fetch_netbox_devices() {
   fi
 
   "${jq_bin}" '
-    unique_by(.id)
+    unique_by(.printlabel_kind, .id)
     | sort_by(.name // "", .asset_tag // "", .serial // "", .id)
   ' <<< "${search_matches}"
 }
 
-select_netbox_device() {
+select_netbox_object() {
   local nbx_bin="$1"
   local jq_bin="$2"
   local netbox_url="$3"
   local netbox_token="$4"
   local netbox_query="${5:-}"
   local fzf_bin
-  local devices_json
-  local device_count
+  local objects_json
+  local object_count
+  local narrowed_json=""
+  local narrowed_count=""
   local selected_line
+  local selected_kind
   local selected_id
   local cache_file
+  local candidates_file
+  local selection_file
   local -a fzf_args
 
-  devices_json="$(
-    fetch_netbox_devices "${nbx_bin}" "${jq_bin}" "${netbox_url}" "${netbox_token}" "${netbox_query}"
+  objects_json="$(
+    fetch_netbox_objects "${nbx_bin}" "${jq_bin}" "${netbox_url}" "${netbox_token}" "${netbox_query}"
   )" || return 1
 
-  device_count="$("${jq_bin}" -r 'length' <<< "${devices_json}")" || return 1
+  object_count="$("${jq_bin}" -r 'length' <<< "${objects_json}")" || return 1
 
-  if [[ "${device_count}" -eq 0 ]]
+  if [[ "${object_count}" -eq 0 ]]
   then
     if [[ -n "${netbox_query}" ]]
     then
-      echo "No NetBox device matched '${netbox_query}'." >&2
+      echo "No NetBox device or rack matched '${netbox_query}'." >&2
     else
-      echo "No NetBox devices found." >&2
+      echo "No NetBox devices or racks found." >&2
     fi
     return 1
   fi
 
-  if [[ "${device_count}" -eq 1 ]]
+  if [[ "${object_count}" -eq 1 ]]
   then
-    "${jq_bin}" -c '.[0]' <<< "${devices_json}"
+    "${jq_bin}" -c '.[0]' <<< "${objects_json}"
     return 0
   fi
 
+  if [[ -n "${netbox_query}" ]]
+  then
+    narrowed_json="$(
+      # shellcheck disable=SC2016
+      "${jq_bin}" -c --arg query "${netbox_query}" '
+        map(
+          select(
+            (.name // "" | ascii_downcase | contains($query | ascii_downcase))
+            or (.serial // "" | ascii_downcase | contains($query | ascii_downcase))
+            or (.asset_tag // "" | ascii_downcase | contains($query | ascii_downcase))
+          )
+        )
+      ' <<< "${objects_json}"
+    )" || return 1
+
+    narrowed_count="$("${jq_bin}" -r 'length' <<< "${narrowed_json}")" || return 1
+
+    if [[ "${narrowed_count}" -eq 1 ]]
+    then
+      "${jq_bin}" -c '.[0]' <<< "${narrowed_json}"
+      return 0
+    fi
+
+    if [[ "${narrowed_count}" -gt 1 ]]
+    then
+      objects_json="${narrowed_json}"
+      object_count="${narrowed_count}"
+    fi
+  fi
+
   fzf_bin="$(find_fzf)" || return 1
-  cache_file="$(mktemp printlabel-netbox-devices.XXXXXX.json)"
-  printf '%s\n' "${devices_json}" > "${cache_file}"
+  cache_file="$(mktemp printlabel-netbox-objects.XXXXXX.json)"
+  candidates_file="$(mktemp printlabel-netbox-candidates.XXXXXX.tsv)"
+  selection_file="$(mktemp printlabel-netbox-selection.XXXXXX.txt)"
+  printf '%s\n' "${objects_json}" > "${cache_file}"
   fzf_args=(
     --delimiter=$'\t'
-    --with-nth=2
-    --nth=1
-    --prompt='NetBox device> '
-    --header='Select a device to print'
+    "--with-nth=3,1,2,4,5,6,7"
+    "--nth=2,3,4,5,6,7"
+    --select-1
+    --exit-0
+    --prompt='NetBox object> '
+    --header='Select a device or rack to print'
     --preview-window='right:60%:wrap'
     --preview "
-      ${jq_bin} -r --arg id {1} '
+      ${jq_bin} -r --arg kind {1} --arg id {2} '
         .[] |
-        select((.id | tostring) == \$id) |
+        select(.printlabel_kind == \$kind and (.id | tostring) == \$id) |
         [
+          \"Type: \" + (.printlabel_kind // \"\"),
           \"ID: \" + (.id | tostring),
           \"Name: \" + (.name // \"\"),
           \"Asset tag: \" + (.asset_tag // \"\"),
           \"Serial: \" + (.serial // \"\"),
+          \"Manufacturer: \" + (.device_type.manufacturer.name // \"\"),
+          \"Device type: \" + (.device_type.model // \"\"),
           \"Role: \" + (.role.name // \"\"),
           \"Site: \" + (.site.name // \"\"),
           \"Location: \" + (.location.name // \"\"),
@@ -595,28 +710,37 @@ select_netbox_device() {
     fzf_args+=(--query "${netbox_query}")
   fi
 
-  selected_line="$(
-    "${jq_bin}" -r '
-      .[] |
-      [
-        (.id | tostring),
-        (.name // ""),
-        (.asset_tag // ""),
-        (.serial // ""),
-        (.role.name // ""),
-        (.site.name // "")
-      ] | @tsv
-    ' "${cache_file}" | \
-      "${fzf_bin}" "${fzf_args[@]}"
-  )" || {
-    rm -f "${cache_file}"
+  "${jq_bin}" -r '
+    .[] |
+    [
+      (.printlabel_kind // ""),
+      (.id | tostring),
+      (.name // ""),
+      (.asset_tag // ""),
+      (.serial // ""),
+      (.role.name // ""),
+      (.site.name // "")
+    ] | @tsv
+  ' "${cache_file}" > "${candidates_file}" || {
+    rm -f "${cache_file}" "${candidates_file}" "${selection_file}"
     return 1
   }
 
-  selected_id="${selected_line%%$'\t'*}"
+  "${fzf_bin}" "${fzf_args[@]}" < "${candidates_file}" > "${selection_file}" || {
+    rm -f "${cache_file}"
+    rm -f "${candidates_file}" "${selection_file}"
+    return 1
+  }
+
+  selected_line="$(< "${selection_file}")"
+  rm -f "${candidates_file}" "${selection_file}"
+
+  selected_kind="${selected_line%%$'\t'*}"
+  selected_id="${selected_line#*$'\t'}"
+  selected_id="${selected_id%%$'\t'*}"
   # shellcheck disable=SC2016
-  "${jq_bin}" -c --arg id "${selected_id}" '
-    .[] | select((.id | tostring) == $id)
+  "${jq_bin}" -c --arg kind "${selected_kind}" --arg id "${selected_id}" '
+    .[] | select(.printlabel_kind == $kind and (.id | tostring) == $id)
   ' "${cache_file}"
   rm -f "${cache_file}"
 }
@@ -624,15 +748,14 @@ select_netbox_device() {
 render_netbox_label() {
   local image_tool="$1"
   local qr_tool="$2"
-  local netbox_url="$3"
-  local device_id="$4"
-  local device_name="$5"
-  local asset_tag="$6"
-  local serial_number="$7"
-  local font_name="$8"
-  local qr_size="$9"
-  local black_mode="${10}"
-  local simple_mode="${11}"
+  local object_url="$3"
+  local object_name="$4"
+  local asset_tag="$5"
+  local serial_number="$6"
+  local font_name="$7"
+  local qr_size="$8"
+  local black_mode="$9"
+  local simple_mode="${10}"
   local qr_source_image
   local qr_image
   local text_image
@@ -655,7 +778,7 @@ render_netbox_label() {
     --size=1 \
     --type=PNG \
     --output="${qr_source_image}" \
-    "${netbox_url%/}/dcim/devices/${device_id}/" || return 1
+    "${object_url}" || return 1
 
   "${image_tool}" \
     "${qr_source_image}" \
@@ -677,10 +800,10 @@ render_netbox_label() {
     text_pointsize="${simple_text_pointsize}"
     text_block="${asset_tag}"
   else
-    device_name="$(normalize_label_line "${device_name}")"
+    object_name="$(normalize_label_line "${object_name}")"
     serial_number="$(normalize_label_line "${serial_number}")"
 
-    text_block="${device_name}"
+    text_block="${object_name}"
     if [[ -n "${asset_tag}" ]]
     then
       text_block="${text_block}"$'\n'"${asset_tag}"
@@ -753,6 +876,28 @@ render_netbox_label() {
   echo "NetBox mode (${qr_size}px QR)"
 }
 
+print_netbox_summary() {
+  local jq_bin="$1"
+  local netbox_object_json="$2"
+
+  "${jq_bin}" -r '
+    [
+      "NetBox object:",
+      "  Type: " + (.printlabel_kind // "unknown"),
+      "  ID: " + ((.id // "") | tostring),
+      "  Name: " + (.name // ""),
+      "  Manufacturer: " + (.device_type.manufacturer.name // ""),
+      "  Device type: " + (.device_type.model // ""),
+      "  Asset tag: " + (.asset_tag // ""),
+      "  Serial: " + (.serial // ""),
+      "  Role: " + (.role.name // ""),
+      "  Site: " + (.site.name // ""),
+      "  Location: " + (.location.name // ""),
+      "  URL: " + (.display_url // "")
+    ] | join("\n")
+  ' <<< "${netbox_object_json}"
+}
+
 preview_label() {
   local preview_mode="${1:-}"
 
@@ -791,8 +936,10 @@ main() {
   local nbx_bin
   local font_name
   local label_text
-  local netbox_device_id=""
-  local netbox_device_json=""
+  local netbox_object_id=""
+  local netbox_object_json=""
+  local netbox_object_kind=""
+  local netbox_object_url=""
   local netbox_mode=""
   local netbox_query=""
   local netbox_token="${NETBOX_API_TOKEN:-}"
@@ -814,7 +961,7 @@ main() {
   local -a positional_args=()
   local qr_tool
   local qr_label_text=""
-  local device_name=""
+  local object_name=""
   local asset_tag=""
   local serial_number=""
   local print_index
@@ -1041,33 +1188,42 @@ main() {
       label_image="$(mktemp --suffix=.png printlabel.XXXXXX)"
       trap cleanup EXIT
 
-      netbox_device_json="$(
-        select_netbox_device "${nbx_bin}" "${jq_bin}" "${netbox_url}" "${netbox_token}" "${netbox_query}"
+      netbox_object_json="$(
+        select_netbox_object "${nbx_bin}" "${jq_bin}" "${netbox_url}" "${netbox_token}" "${netbox_query}"
       )" || return 1
 
-      netbox_device_id="$("${jq_bin}" -r '.id' <<< "${netbox_device_json}")" || return 1
-      device_name="$("${jq_bin}" -r '.name // ""' <<< "${netbox_device_json}")" || return 1
-      asset_tag="$("${jq_bin}" -r '.asset_tag // ""' <<< "${netbox_device_json}")" || return 1
-      serial_number="$("${jq_bin}" -r '.serial // ""' <<< "${netbox_device_json}")" || return 1
+      netbox_object_id="$("${jq_bin}" -r '.id' <<< "${netbox_object_json}")" || return 1
+      netbox_object_kind="$("${jq_bin}" -r '.printlabel_kind // ""' <<< "${netbox_object_json}")" || return 1
+      netbox_object_url="$("${jq_bin}" -r '.display_url // ""' <<< "${netbox_object_json}")" || return 1
+      object_name="$("${jq_bin}" -r '.name // ""' <<< "${netbox_object_json}")" || return 1
+      asset_tag="$("${jq_bin}" -r '.asset_tag // ""' <<< "${netbox_object_json}")" || return 1
+      serial_number="$("${jq_bin}" -r '.serial // ""' <<< "${netbox_object_json}")" || return 1
 
       if [[ -n "${simple_mode}" && -z "${asset_tag}" ]]
       then
-        echo "NetBox device ${netbox_device_id} has no asset tag for --simple mode." >&2
+        echo "NetBox ${netbox_object_kind} ${netbox_object_id} has no asset tag for --simple mode." >&2
         return 1
       fi
 
-      if [[ -z "${simple_mode}" && -z "${device_name}" ]]
+      if [[ -z "${netbox_object_url}" ]]
       then
-        echo "NetBox device ${netbox_device_id} has no name." >&2
+        echo "NetBox ${netbox_object_kind} ${netbox_object_id} has no display URL." >&2
         return 1
       fi
+
+      if [[ -z "${simple_mode}" && -z "${object_name}" ]]
+      then
+        echo "NetBox ${netbox_object_kind} ${netbox_object_id} has no name." >&2
+        return 1
+      fi
+
+      print_netbox_summary "${jq_bin}" "${netbox_object_json}" || return 1
 
       render_netbox_label \
         "${image_tool}" \
         "${qr_tool}" \
-        "${netbox_url}" \
-        "${netbox_device_id}" \
-        "${device_name}" \
+        "${netbox_object_url}" \
+        "${object_name}" \
         "${asset_tag}" \
         "${serial_number}" \
         "${font_name}" \
