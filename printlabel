@@ -809,13 +809,7 @@ select_netbox_object() {
 
     narrowed_count="$("${jq_bin}" -r 'length' <<< "${narrowed_json}")" || return 1
 
-    if [[ "${narrowed_count}" -eq 1 ]]
-    then
-      "${jq_bin}" -c '.[0]' <<< "${narrowed_json}"
-      return 0
-    fi
-
-    if [[ "${narrowed_count}" -gt 1 ]]
+    if [[ "${narrowed_count}" -gt 0 ]]
     then
       objects_json="${narrowed_json}"
       object_count="${narrowed_count}"
@@ -828,30 +822,35 @@ select_netbox_object() {
   selection_file="$(mktemp printlabel-netbox-selection.XXXXXX.txt)"
   printf '%s\n' "${objects_json}" > "${cache_file}"
   fzf_args=(
+    --ansi
     --delimiter=$'\t'
-    "--with-nth=3,1,2,4,5,6,7"
-    "--nth=2,3,4,5,6,7"
-    --select-1
-    --exit-0
+    "--with-nth=3"
     --prompt='NetBox object> '
     --header='Select a device or rack to print'
     --preview-window='right:60%:wrap'
     --preview "
       ${jq_bin} -r --arg kind {1} --arg id {2} '
+        def color(code; text):
+          \"\u001b[\" + code + \"m\" + text + \"\u001b[0m\";
+        def spaces(count):
+          reduce range(0; count) as \$index (\"\"; . + \" \");
+        def field(field_name; label_code; value; value_code):
+          (field_name as \$label | color(label_code; (\$label + spaces(14 - (\$label | length))))) + \"  \" + color(value_code; value);
+
         .[] |
         select(.printlabel_kind == \$kind and (.id | tostring) == \$id) |
         [
-          \"Type: \" + (.printlabel_kind // \"\"),
-          \"ID: \" + (.id | tostring),
-          \"Name: \" + (.name // \"\"),
-          \"Asset tag: \" + (.asset_tag // \"\"),
-          \"Serial: \" + (.serial // \"\"),
-          \"Manufacturer: \" + (.device_type.manufacturer.name // \"\"),
-          \"Device type: \" + (.device_type.model // \"\"),
-          \"Role: \" + (.role.name // \"\"),
-          \"Site: \" + (.site.name // \"\"),
-          \"Location: \" + (.location.name // \"\"),
-          \"URL: \" + (.display_url // \"\")
+          field(\"Type\"; \"1;36\"; (.printlabel_kind // \"\"); \"0;33\"),
+          field(\"ID\"; \"1;36\"; (.id | tostring); \"0;33\"),
+          field(\"Name\"; \"1;36\"; (.name // \"\"); \"0;32\"),
+          field(\"Asset tag\"; \"1;36\"; (.asset_tag // \"\"); \"0;33\"),
+          field(\"Serial\"; \"1;36\"; (.serial // \"\"); \"0;33\"),
+          field(\"Manufacturer\"; \"1;36\"; (.device_type.manufacturer.name // \"\"); \"0;32\"),
+          field(\"Device type\"; \"1;36\"; (.device_type.model // \"\"); \"0;32\"),
+          field(\"Role\"; \"1;36\"; (.role.name // \"\"); \"0;32\"),
+          field(\"Site\"; \"1;36\"; (.site.name // \"\"); \"0;32\"),
+          field(\"Location\"; \"1;36\"; (.location.name // \"\"); \"0;32\"),
+          field(\"URL\"; \"1;36\"; (.display_url // \"\"); \"0;34\")
         ] | join(\"\\n\")
       ' '${cache_file}'
     "
