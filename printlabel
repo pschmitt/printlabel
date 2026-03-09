@@ -224,17 +224,6 @@ find_magick() {
   return 1
 }
 
-find_curl() {
-  if command -v curl >/dev/null 2>&1
-  then
-    printf '%s\n' "curl"
-    return 0
-  fi
-
-  log_error "curl is required for NetBox image previews."
-  return 1
-}
-
 find_font() {
   local font_name
 
@@ -785,13 +774,12 @@ select_netbox_object() {
   local narrowed_json=""
   local narrowed_count=""
   local selected_line
-  local selected_kind
-  local selected_id
+  local selected_index
   local cache_file
   local candidates_file
   local selection_file
   local preview_command
-  local preview_script
+  local preview_nbx_bin
   local preview_cache
   local preview_netbox_url
   local preview_netbox_token
@@ -849,15 +837,15 @@ select_netbox_object() {
   candidates_file="$(mktemp printlabel-netbox-candidates.XXXXXX.tsv)"
   selection_file="$(mktemp printlabel-netbox-selection.XXXXXX.txt)"
   printf '%s\n' "${objects_json}" > "${cache_file}"
-  printf -v preview_script '%q' "${BASH_SOURCE[0]}"
+  printf -v preview_nbx_bin '%q' "${nbx_bin}"
   printf -v preview_cache '%q' "${cache_file}"
   printf -v preview_netbox_url '%q' "${netbox_url}"
   printf -v preview_netbox_token '%q' "${netbox_token}"
-  preview_command="PRINTLABEL_FORCE_COLOR=1 PRINTLABEL_FORCE_KITTY=1 ${preview_script} __netbox-preview ${preview_cache} {1} {2} ${preview_netbox_url} ${preview_netbox_token}"
+  preview_command="NBX_FORCE_COLOR=1 NBX_FORCE_KITTY=1 NETBOX_URL=${preview_netbox_url} NETBOX_API_TOKEN=${preview_netbox_token} ${preview_nbx_bin} --fzf-preview auto ${preview_cache} {1}"
   fzf_args=(
     --ansi
     --delimiter=$'\t'
-    "--with-nth=3"
+    "--with-nth=4"
     --prompt='NetBox object> '
     --header='Select a device or rack to print'
     --preview-window='right:60%:wrap'
@@ -870,15 +858,16 @@ select_netbox_object() {
   fi
 
   "${jq_bin}" -r '
-    .[] |
+    to_entries[] |
     [
-      (.printlabel_kind // ""),
-      (.id | tostring),
-      (.name // ""),
-      (.asset_tag // ""),
-      (.serial // ""),
-      (.role.name // ""),
-      (.site.name // "")
+      (.key | tostring),
+      (.value.printlabel_kind // ""),
+      (.value.id | tostring),
+      (.value.name // ""),
+      (.value.asset_tag // ""),
+      (.value.serial // ""),
+      (.value.role.name // ""),
+      (.value.site.name // "")
     ] | @tsv
   ' "${cache_file}" > "${candidates_file}" || {
     rm -f "${cache_file}" "${candidates_file}" "${selection_file}"
@@ -894,12 +883,10 @@ select_netbox_object() {
   selected_line="$(< "${selection_file}")"
   rm -f "${candidates_file}" "${selection_file}"
 
-  selected_kind="${selected_line%%$'\t'*}"
-  selected_id="${selected_line#*$'\t'}"
-  selected_id="${selected_id%%$'\t'*}"
+  selected_index="${selected_line%%$'\t'*}"
   # shellcheck disable=SC2016
-  "${jq_bin}" -c --arg kind "${selected_kind}" --arg id "${selected_id}" '
-    .[] | select(.printlabel_kind == $kind and (.id | tostring) == $id)
+  "${jq_bin}" -c --arg index "${selected_index}" '
+    .[$index | tonumber]
   ' "${cache_file}"
   rm -f "${cache_file}"
 }
@@ -1090,258 +1077,6 @@ print_netbox_summary() {
   done <<< "${summary_lines}"
 }
 
-netbox_preview_summary_lines() {
-  local jq_bin="$1"
-  local netbox_object_json="$2"
-
-  "${jq_bin}" -r '
-    [
-      ["Type", .printlabel_kind // "unknown"],
-      ["ID", ((.id // "") | tostring)],
-      ["Name", (.name // "")],
-      ["Manufacturer", (.device_type.manufacturer.name // "")],
-      ["Device type", (.device_type.model // "")],
-      ["Asset tag", (.asset_tag // "")],
-      ["Serial", (.serial // "")],
-      ["Role", (.role.name // "")],
-      ["Site", (.site.name // "")],
-      ["Location", (.location.name // "")],
-      ["URL", (.display_url // "")]
-    ]
-    | .[]
-    | @tsv
-  ' <<< "${netbox_object_json}"
-}
-
-print_netbox_fzf_preview_summary() {
-  local jq_bin="$1"
-  local netbox_object_json="$2"
-  local summary_lines
-  local key
-  local value
-  local value_color
-  local width=14
-
-  summary_lines="$(netbox_preview_summary_lines "${jq_bin}" "${netbox_object_json}")" || return 1
-
-  while IFS=$'\t' read -r key value
-  do
-    if [[ -z "${value}" ]]
-    then
-      value="$(colorize_multi 'gray strikethrough' 'N/A' 1)"
-    else
-      value_color="$(netbox_value_color "${key}")"
-      value="$(colorize "${value_color}" "${value}" 1)"
-    fi
-
-    printf '%s  %s\n' \
-      "$(colorize_multi 'bold cyan' "$(printf '%-*s' "${width}" "${key}")" 1)" \
-      "${value}"
-  done <<< "${summary_lines}"
-}
-
-resolve_netbox_media_url() {
-  local base_url="$1"
-  local media_url="$2"
-
-  if [[ -z "${media_url}" ]]
-  then
-    return 0
-  fi
-
-  if [[ "${media_url}" =~ ^https?:// ]]
-  then
-    printf '%s\n' "${media_url}"
-    return 0
-  fi
-
-  if [[ -z "${base_url}" ]]
-  then
-    printf '%s\n' "${media_url}"
-    return 0
-  fi
-
-  if [[ "${media_url}" == /* ]]
-  then
-    printf '%s%s\n' "${base_url%/}" "${media_url}"
-    return 0
-  fi
-
-  printf '%s/%s\n' "${base_url%/}" "${media_url#./}"
-}
-
-fetch_netbox_device_type_json() {
-  local jq_bin="$1"
-  local netbox_object_json="$2"
-  local netbox_url="$3"
-  local netbox_token="$4"
-  local curl_bin
-  local device_type_url=""
-  local device_type_id=""
-  local resolved_device_type_url=""
-
-  device_type_url="$("${jq_bin}" -r '
-    .device_type.url? // ""
-  ' <<< "${netbox_object_json}")" || return 1
-  device_type_id="$("${jq_bin}" -r '
-    (.device_type.id? // "") | tostring
-  ' <<< "${netbox_object_json}")" || return 1
-
-  if [[ -n "${device_type_url}" && "${device_type_url}" != "null" ]]
-  then
-    resolved_device_type_url="$(resolve_netbox_media_url "${netbox_url}" "${device_type_url}")"
-  elif [[ -n "${device_type_id}" && "${device_type_id}" != "null" && -n "${netbox_url}" ]]
-  then
-    resolved_device_type_url="${netbox_url%/}/api/dcim/device-types/${device_type_id}/"
-  else
-    return 1
-  fi
-
-  curl_bin="$(find_curl)" || return 1
-
-  if [[ -n "${netbox_token}" ]]
-  then
-    "${curl_bin}" -fsSL \
-      -H "Authorization: Token ${netbox_token}" \
-      "${resolved_device_type_url}"
-    return $?
-  fi
-
-  "${curl_bin}" -fsSL "${resolved_device_type_url}"
-}
-
-extract_netbox_front_image_url() {
-  local jq_bin="$1"
-  local json_input="$2"
-
-  "${jq_bin}" -r '
-    [
-      .front_image.url?,
-      .front_image?,
-      .front_image_url?,
-      .device_type.front_image.url?,
-      .device_type.front_image?,
-      .device_type.front_image_url?,
-      .image_front.url?,
-      .image_front?,
-      .device_type.image_front.url?,
-      .device_type.image_front?
-    ]
-    | map(select(type == "string" and length > 0 and . != "null"))
-    | first // ""
-  ' <<< "${json_input}"
-}
-
-print_netbox_fzf_preview_image() {
-  local jq_bin="$1"
-  local netbox_object_json="$2"
-  local netbox_url="$3"
-  local netbox_token="$4"
-  local curl_bin
-  local image_tool
-  local image_url=""
-  local resolved_image_url
-  local device_type_json=""
-  local tmp_dir
-  local source_image
-  local preview_image
-
-  if ! can_preview_with_kitty
-  then
-    return 1
-  fi
-
-  curl_bin="$(find_curl)" || return 1
-  image_url="$(extract_netbox_front_image_url "${jq_bin}" "${netbox_object_json}")" || return 1
-
-  if [[ -z "${image_url}" ]]
-  then
-    device_type_json="$(
-      fetch_netbox_device_type_json "${jq_bin}" "${netbox_object_json}" "${netbox_url}" "${netbox_token}"
-    )" || return 1
-    image_url="$(extract_netbox_front_image_url "${jq_bin}" "${device_type_json}")" || return 1
-  fi
-
-  if [[ -z "${image_url}" ]]
-  then
-    return 1
-  fi
-
-  resolved_image_url="$(resolve_netbox_media_url "${netbox_url}" "${image_url}")"
-  tmp_dir="$(mktemp -d printlabel-netbox-preview.XXXXXX)" || return 1
-  source_image="${tmp_dir}/source-image"
-  preview_image="${tmp_dir}/preview-image.png"
-
-  if [[ -n "${netbox_token}" ]]
-  then
-    "${curl_bin}" -fsSL \
-      -H "Authorization: Token ${netbox_token}" \
-      "${resolved_image_url}" \
-      -o "${source_image}" || {
-      rm -rf "${tmp_dir}"
-      return 1
-    }
-  else
-    "${curl_bin}" -fsSL "${resolved_image_url}" -o "${source_image}" || {
-      rm -rf "${tmp_dir}"
-      return 1
-    }
-  fi
-
-  if image_tool="$(find_magick 2>/dev/null)"
-  then
-    "${image_tool}" "${source_image}" -resize x200 "${preview_image}" >/dev/null 2>&1 || {
-      rm -rf "${tmp_dir}"
-      return 1
-    }
-  else
-    cp "${source_image}" "${preview_image}" || {
-      rm -rf "${tmp_dir}"
-      return 1
-    }
-  fi
-
-  kitten icat --clear >/dev/null 2>&1 || true
-  kitten icat \
-    --stdin=no \
-    --transfer-mode=stream \
-    --align=left \
-    --no-trailing-newline \
-    "${preview_image}" || {
-    rm -rf "${tmp_dir}"
-    return 1
-  }
-  printf '\n\n'
-  rm -rf "${tmp_dir}"
-}
-
-print_netbox_fzf_preview() {
-  local cache_file="$1"
-  local selected_kind="$2"
-  local selected_id="$3"
-  local netbox_url="$4"
-  local netbox_token="$5"
-  local jq_bin
-  local netbox_object_json
-
-  jq_bin="$(find_jq)" || return 1
-  netbox_object_json="$(
-    # shellcheck disable=SC2016
-    "${jq_bin}" -c --arg kind "${selected_kind}" --arg id "${selected_id}" '
-      .[] | select(.printlabel_kind == $kind and (.id | tostring) == $id)
-    ' "${cache_file}"
-  )" || return 1
-
-  if [[ -z "${netbox_object_json}" ]]
-  then
-    return 1
-  fi
-
-  print_netbox_fzf_preview_summary "${jq_bin}" "${netbox_object_json}"
-  printf '\n'
-  print_netbox_fzf_preview_image "${jq_bin}" "${netbox_object_json}" "${netbox_url}" "${netbox_token}" || true
-}
-
 preview_label() {
   local preview_mode="${1:-}"
 
@@ -1412,13 +1147,6 @@ main() {
 
   script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   init_color_support
-
-  if [[ "${1:-}" == "__netbox-preview" ]]
-  then
-    shift
-    print_netbox_fzf_preview "$@"
-    return $?
-  fi
 
   while [[ -n "${1:-}" ]]
   do
