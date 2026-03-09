@@ -1290,7 +1290,7 @@ print_netbox_fzf_preview_image() {
 
   if image_tool="$(find_magick 2>/dev/null)"
   then
-    "${image_tool}" "${source_image}" -resize 200x "${preview_image}" >/dev/null 2>&1 || {
+    "${image_tool}" "${source_image}" -resize x200 "${preview_image}" >/dev/null 2>&1 || {
       rm -rf "${tmp_dir}"
       return 1
     }
