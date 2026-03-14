@@ -832,6 +832,12 @@ select_netbox_object() {
     fi
   fi
 
+  if [[ "${object_count}" -eq 1 ]]
+  then
+    "${jq_bin}" -c '.[0]' <<< "${objects_json}"
+    return 0
+  fi
+
   fzf_bin="$(find_fzf)" || return 1
   cache_file="$(mktemp printlabel-netbox-objects.XXXXXX.json)"
   candidates_file="$(mktemp printlabel-netbox-candidates.XXXXXX.tsv)"
@@ -841,7 +847,7 @@ select_netbox_object() {
   printf -v preview_cache '%q' "${cache_file}"
   printf -v preview_netbox_url '%q' "${netbox_url}"
   printf -v preview_netbox_token '%q' "${netbox_token}"
-  preview_command="NBX_FORCE_COLOR=1 NBX_FORCE_KITTY=1 NETBOX_URL=${preview_netbox_url} NETBOX_API_TOKEN=${preview_netbox_token} ${preview_nbx_bin} --fzf-preview auto ${preview_cache} {1}"
+  preview_command="NBX_FORCE_COLOR=1 NBX_FORCE_KITTY=1 NETBOX_URL=${preview_netbox_url} NETBOX_API_TOKEN=${preview_netbox_token} ${preview_nbx_bin} --fzf-preview {2} ${preview_cache} {1}"
   fzf_args=(
     --ansi
     --delimiter=$'\t'
