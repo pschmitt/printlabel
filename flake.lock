@@ -28,11 +28,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1773092736,
-        "narHash": "sha256-BcM2J2GoPl+AYslA9yRv37pUNgVFMn2M4JhJhkAQnyA=",
+        "lastModified": 1773616322,
+        "narHash": "sha256-tdqWdTn0D/U6pcuewpiEUVKD1NOmEEuakv3YFIaZMQQ=",
         "owner": "pschmitt",
         "repo": "nbx",
-        "rev": "e86354375a65ac3a9e180501aebfe59739daf02c",
+        "rev": "48606c225801f8c8f7eaf6d8ced680b174b22a8b",
         "type": "github"
       },
       "original": {
