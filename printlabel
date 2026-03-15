@@ -15,7 +15,7 @@ Options:
   -c, --count N        Print the same label N times
       --image PATH     Print an existing image file
       --qr TEXT        Generate and print a QR code (optionally with right-side label text)
-      --netbox [QUERY] Resolve a NetBox device or rack by id, name, serial, or asset tag
+      --netbox [QUERY] Resolve a NetBox device, rack, module, or inventory item by id, name, serial, or asset tag
       --simple         In NetBox mode, print only QR code and asset tag
       --netbox-url URL NetBox base URL, overrides NETBOX_URL
       --netbox-token T NetBox API token, overrides NETBOX_API_TOKEN
@@ -632,14 +632,26 @@ fetch_netbox_objects() {
   local response
   local devices_response
   local racks_response
+  local modules_response
+  local inventory_items_response
   local exact_matches
   local search_matches
   local devices_file
   local racks_file
+  local modules_file
+  local inventory_items_file
 
   devices_file="$(mktemp printlabel-netbox-devices.XXXXXX.json)" || return 1
   racks_file="$(mktemp printlabel-netbox-racks.XXXXXX.json)" || {
     rm -f "${devices_file}"
+    return 1
+  }
+  modules_file="$(mktemp printlabel-netbox-modules.XXXXXX.json)" || {
+    rm -f "${devices_file}" "${racks_file}"
+    return 1
+  }
+  inventory_items_file="$(mktemp printlabel-netbox-inventory-items.XXXXXX.json)" || {
+    rm -f "${devices_file}" "${racks_file}" "${modules_file}"
     return 1
   }
 
@@ -655,20 +667,34 @@ fetch_netbox_objects() {
         NETBOX_API_TOKEN="${netbox_token}" \
         "${nbx_bin}" -j racks
     )" || return 1
+    modules_response="$(
+      NETBOX_URL="${netbox_url}" \
+        NETBOX_API_TOKEN="${netbox_token}" \
+        "${nbx_bin}" -j modules
+    )" || return 1
+    inventory_items_response="$(
+      NETBOX_URL="${netbox_url}" \
+        NETBOX_API_TOKEN="${netbox_token}" \
+        "${nbx_bin}" -j inventory-items
+    )" || return 1
 
     printf '%s\n' "${devices_response}" > "${devices_file}"
     printf '%s\n' "${racks_response}" > "${racks_file}"
+    printf '%s\n' "${modules_response}" > "${modules_file}"
+    printf '%s\n' "${inventory_items_response}" > "${inventory_items_file}"
 
     # shellcheck disable=SC2016
     "${jq_bin}" -s '
       [
         (.[0][] | . + {printlabel_kind: "device"}),
-        (.[1][] | . + {printlabel_kind: "rack"})
+        (.[1][] | . + {printlabel_kind: "rack"}),
+        (.[2][] | . + {printlabel_kind: "module"}),
+        (.[3][] | . + {printlabel_kind: "inventory-item"})
       ]
       | unique_by(.printlabel_kind, .id)
-      | sort_by(.name // "", .asset_tag // "", .serial // "", .id)
-    ' "${devices_file}" "${racks_file}"
-    rm -f "${devices_file}" "${racks_file}"
+      | sort_by(.name // .label // .module_type.model // .module_bay.name // "", .asset_tag // "", .serial // "", .id)
+    ' "${devices_file}" "${racks_file}" "${modules_file}" "${inventory_items_file}"
+    rm -f "${devices_file}" "${racks_file}" "${modules_file}" "${inventory_items_file}"
     return $?
   fi
 
@@ -684,23 +710,37 @@ fetch_netbox_objects() {
         NETBOX_API_TOKEN="${netbox_token}" \
         "${nbx_bin}" -j racks "id=${netbox_query}"
     )" || return 1
+    modules_response="$(
+      NETBOX_URL="${netbox_url}" \
+        NETBOX_API_TOKEN="${netbox_token}" \
+        "${nbx_bin}" -j modules "id=${netbox_query}"
+    )" || return 1
+    inventory_items_response="$(
+      NETBOX_URL="${netbox_url}" \
+        NETBOX_API_TOKEN="${netbox_token}" \
+        "${nbx_bin}" -j inventory-items "id=${netbox_query}"
+    )" || return 1
 
     printf '%s\n' "${devices_response}" > "${devices_file}"
     printf '%s\n' "${racks_response}" > "${racks_file}"
+    printf '%s\n' "${modules_response}" > "${modules_file}"
+    printf '%s\n' "${inventory_items_response}" > "${inventory_items_file}"
 
     response="$(
       # shellcheck disable=SC2016
       "${jq_bin}" -s '
         [
           (.[0][] | . + {printlabel_kind: "device"}),
-          (.[1][] | . + {printlabel_kind: "rack"})
+          (.[1][] | . + {printlabel_kind: "rack"}),
+          (.[2][] | . + {printlabel_kind: "module"}),
+          (.[3][] | . + {printlabel_kind: "inventory-item"})
         ]
         | unique_by(.printlabel_kind, .id)
-        | sort_by(.name // "", .asset_tag // "", .serial // "", .id)
-      ' "${devices_file}" "${racks_file}"
+        | sort_by(.name // .label // .module_type.model // .module_bay.name // "", .asset_tag // "", .serial // "", .id)
+      ' "${devices_file}" "${racks_file}" "${modules_file}" "${inventory_items_file}"
     )" || return 1
 
-    rm -f "${devices_file}" "${racks_file}"
+    rm -f "${devices_file}" "${racks_file}" "${modules_file}" "${inventory_items_file}"
 
     if [[ "$("${jq_bin}" -r 'length' <<< "${response}")" -gt 0 ]]
     then
@@ -719,21 +759,35 @@ fetch_netbox_objects() {
       NETBOX_API_TOKEN="${netbox_token}" \
       "${nbx_bin}" -j racks "q=${netbox_query}"
   )" || return 1
+  modules_response="$(
+    NETBOX_URL="${netbox_url}" \
+      NETBOX_API_TOKEN="${netbox_token}" \
+      "${nbx_bin}" -j modules "q=${netbox_query}"
+  )" || return 1
+  inventory_items_response="$(
+    NETBOX_URL="${netbox_url}" \
+      NETBOX_API_TOKEN="${netbox_token}" \
+      "${nbx_bin}" -j inventory-items "q=${netbox_query}"
+  )" || return 1
 
   printf '%s\n' "${devices_response}" > "${devices_file}"
   printf '%s\n' "${racks_response}" > "${racks_file}"
+  printf '%s\n' "${modules_response}" > "${modules_file}"
+  printf '%s\n' "${inventory_items_response}" > "${inventory_items_file}"
 
   search_matches="$(
     # shellcheck disable=SC2016
     "${jq_bin}" -s '
       [
         (.[0][] | . + {printlabel_kind: "device"}),
-        (.[1][] | . + {printlabel_kind: "rack"})
+        (.[1][] | . + {printlabel_kind: "rack"}),
+        (.[2][] | . + {printlabel_kind: "module"}),
+        (.[3][] | . + {printlabel_kind: "inventory-item"})
       ]
-    ' "${devices_file}" "${racks_file}"
+    ' "${devices_file}" "${racks_file}" "${modules_file}" "${inventory_items_file}"
   )" || return 1
 
-  rm -f "${devices_file}" "${racks_file}"
+  rm -f "${devices_file}" "${racks_file}" "${modules_file}" "${inventory_items_file}"
 
   exact_matches="$(
     # shellcheck disable=SC2016
@@ -741,12 +795,15 @@ fetch_netbox_objects() {
       map(
         select(
           (.name // "" | ascii_downcase) == ($query | ascii_downcase)
+          or (.label // "" | ascii_downcase) == ($query | ascii_downcase)
+          or (.module_type.model // "" | ascii_downcase) == ($query | ascii_downcase)
+          or (.module_bay.name // "" | ascii_downcase) == ($query | ascii_downcase)
           or (.serial // "" | ascii_downcase) == ($query | ascii_downcase)
           or (.asset_tag // "" | ascii_downcase) == ($query | ascii_downcase)
         )
       )
       | unique_by(.printlabel_kind, .id)
-      | sort_by(.name // "", .asset_tag // "", .serial // "", .id)
+      | sort_by(.name // .label // .module_type.model // .module_bay.name // "", .asset_tag // "", .serial // "", .id)
     ' <<< "${search_matches}"
   )" || return 1
 
@@ -758,7 +815,7 @@ fetch_netbox_objects() {
 
   "${jq_bin}" '
     unique_by(.printlabel_kind, .id)
-    | sort_by(.name // "", .asset_tag // "", .serial // "", .id)
+    | sort_by(.name // .label // .module_type.model // .module_bay.name // "", .asset_tag // "", .serial // "", .id)
   ' <<< "${search_matches}"
 }
 
@@ -795,9 +852,9 @@ select_netbox_object() {
   then
     if [[ -n "${netbox_query}" ]]
     then
-      log_error "No NetBox device or rack matched '${netbox_query}'."
+      log_error "No NetBox device, rack, module, or inventory item matched '${netbox_query}'."
     else
-      log_error "No NetBox devices or racks found."
+      log_error "No NetBox devices, racks, modules, or inventory items found."
     fi
     return 1
   fi
@@ -816,6 +873,9 @@ select_netbox_object() {
         map(
           select(
             (.name // "" | ascii_downcase | contains($query | ascii_downcase))
+            or (.label // "" | ascii_downcase | contains($query | ascii_downcase))
+            or (.module_type.model // "" | ascii_downcase | contains($query | ascii_downcase))
+            or (.module_bay.name // "" | ascii_downcase | contains($query | ascii_downcase))
             or (.serial // "" | ascii_downcase | contains($query | ascii_downcase))
             or (.asset_tag // "" | ascii_downcase | contains($query | ascii_downcase))
           )
@@ -853,7 +913,7 @@ select_netbox_object() {
     --delimiter=$'\t'
     "--with-nth=4"
     --prompt='NetBox object> '
-    --header='Select a device or rack to print'
+    --header='Select a device, rack, module, or inventory item to print'
     --preview-window='right:60%:wrap'
     --preview "${preview_command}"
   )
@@ -869,11 +929,11 @@ select_netbox_object() {
       (.key | tostring),
       (.value.printlabel_kind // ""),
       (.value.id | tostring),
-      (.value.name // ""),
+      (.value.name // .value.label // .value.module_type.model // .value.module_bay.name // ""),
       (.value.asset_tag // ""),
       (.value.serial // ""),
-      (.value.role.name // ""),
-      (.value.site.name // "")
+      (.value.role.name // .value.module_bay.name // ""),
+      (.value.site.name // .value.device.site.name // .value.rack.site.name // "")
     ] | @tsv
   ' "${cache_file}" > "${candidates_file}" || {
     rm -f "${cache_file}" "${candidates_file}" "${selection_file}"
@@ -1042,7 +1102,7 @@ print_netbox_summary() {
       "ID",
       "Name",
       "Manufacturer",
-      "Device type",
+      "Model",
       "Asset tag",
       "Serial",
       "Role",
@@ -1056,14 +1116,14 @@ print_netbox_summary() {
     [
       "Type\t" + (.printlabel_kind // "unknown"),
       "ID\t" + ((.id // "") | tostring),
-      "Name\t" + (.name // ""),
-      "Manufacturer\t" + (.device_type.manufacturer.name // ""),
-      "Device type\t" + (.device_type.model // ""),
+      "Name\t" + (.name // .label // .module_type.model // .module_bay.name // ""),
+      "Manufacturer\t" + (.device_type.manufacturer.name // .module_type.manufacturer.name // .manufacturer.name // ""),
+      "Model\t" + (.device_type.model // .module_type.model // .part_id // ""),
       "Asset tag\t" + (.asset_tag // ""),
       "Serial\t" + (.serial // ""),
-      "Role\t" + (.role.name // ""),
-      "Site\t" + (.site.name // ""),
-      "Location\t" + (.location.name // ""),
+      "Role\t" + (.role.name // .module_bay.name // ""),
+      "Site\t" + (.site.name // .device.site.name // .rack.site.name // ""),
+      "Location\t" + (.location.name // .device.location.name // .rack.location.name // ""),
       "URL\t" + (.display_url // "")
     ] | join("\n")
   ' <<< "${netbox_object_json}")" || return 1
@@ -1381,7 +1441,7 @@ main() {
       netbox_object_id="$("${jq_bin}" -r '.id' <<< "${netbox_object_json}")" || return 1
       netbox_object_kind="$("${jq_bin}" -r '.printlabel_kind // ""' <<< "${netbox_object_json}")" || return 1
       netbox_object_url="$("${jq_bin}" -r '.display_url // ""' <<< "${netbox_object_json}")" || return 1
-      object_name="$("${jq_bin}" -r '.name // ""' <<< "${netbox_object_json}")" || return 1
+      object_name="$("${jq_bin}" -r '.name // .label // .module_type.model // .module_bay.name // ""' <<< "${netbox_object_json}")" || return 1
       asset_tag="$("${jq_bin}" -r '.asset_tag // ""' <<< "${netbox_object_json}")" || return 1
       serial_number="$("${jq_bin}" -r '.serial // ""' <<< "${netbox_object_json}")" || return 1
 

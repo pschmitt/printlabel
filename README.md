@@ -72,10 +72,10 @@ NetBox labels:
 
 ## NetBox
 
-`printlabel` uses [`nbx`](https://github.com/pschmitt/nbx) for device and rack lookup instead of talking to the NetBox API directly.
+`printlabel` uses [`nbx`](https://github.com/pschmitt/nbx) for device, rack, module, and inventory item lookup instead of talking to the NetBox API directly.
 
 - `--netbox [QUERY]` accepts an id, name, serial, or asset tag.
-- `--netbox` with no argument opens `fzf` over all devices and racks.
+- `--netbox` with no argument opens `fzf` over all devices, racks, modules, and inventory items.
 - `--simple` in NetBox mode prints only the QR code and asset tag.
 - Exact matches are resolved first; broader NetBox search is used as fallback.
 - If multiple objects match, `fzf` is used for selection.
@@ -91,7 +91,7 @@ NetBox labels:
 - `--black`: invert QR codes for black tape; in NetBox mode only the QR block is inverted
 - `--raw`: skip preprocessing for `--image`
 - `--invert`: invert black and white
-- `--netbox [QUERY]`: print a NetBox device or rack label
+- `--netbox [QUERY]`: print a NetBox device, rack, module, or inventory item label
 - `--simple`: in NetBox mode, print only the QR code and asset tag
 - `--netbox-url URL`: override `NETBOX_URL`
 - `--netbox-token TOKEN`: override `NETBOX_API_TOKEN`
