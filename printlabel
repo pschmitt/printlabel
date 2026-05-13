@@ -1398,7 +1398,6 @@ main() {
 
   if [[ -n "${image_mode}" ]]
   then
-    printer_address="$(discover_printer_address "${explicit_printer_address}")" || return 1
     image_tool="$(find_magick)" || return 1
     if [[ -n "${image_file}" ]]
     then
@@ -1510,8 +1509,6 @@ main() {
     fi
   else
     label_text="${positional_args[*]}"
-    printer_address="$(discover_printer_address "${explicit_printer_address}")" || return 1
-
     image_tool="$(find_magick)" || return 1
     font_name="$(find_font)"
     label_image="$(mktemp --suffix=.png printlabel.XXXXXX)"
@@ -1524,6 +1521,8 @@ main() {
     fi
     preview_label "${preview_mode}" || return 1
   fi
+
+  printer_address="$(discover_printer_address "${explicit_printer_address}")" || return 1
 
   if ! is_bdaddr "${printer_address}"
   then
