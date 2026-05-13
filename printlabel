@@ -304,7 +304,9 @@ is_bdaddr() {
 
 list_printer_candidates() {
   # bluez 5.86 broke non-interactive subcommands (bluetoothctl devices returns
-  # nothing); herestring triggers interactive mode which works correctly
+  # nothing); herestring triggers interactive mode which works correctly.
+  # Fixed upstream in nixpkgs but not yet in nixos-unstable:
+  # https://github.com/NixOS/nixpkgs/pull/513361
   bluetoothctl <<< "devices" | awk '
     $1 == "Device" && $3 ~ /^PT-P[0-9].*BT/ {
       print $2
