@@ -303,7 +303,7 @@ is_bdaddr() {
 }
 
 list_printer_candidates() {
-  bluetoothctl devices | awk '
+  bluetoothctl <<< "devices" | awk '
     $1 == "Device" && $3 ~ /^PT-P[0-9].*BT/ {
       print $2
     }
@@ -313,15 +313,15 @@ list_printer_candidates() {
 get_device_info() {
   local printer_address="$1"
 
-  bluetoothctl info "${printer_address}" 2>/dev/null
+  bluetoothctl <<< "info ${printer_address}" 2>/dev/null
 }
 
 prepare_printer_connection() {
   local printer_address="$1"
 
   bluetoothctl --timeout 3 scan on >/dev/null 2>&1 || true
-  bluetoothctl trust "${printer_address}" >/dev/null 2>&1 || true
-  bluetoothctl connect "${printer_address}" >/dev/null 2>&1 || true
+  bluetoothctl <<< "trust ${printer_address}" >/dev/null 2>&1 || true
+  bluetoothctl <<< "connect ${printer_address}" >/dev/null 2>&1 || true
   sleep 2
 }
 
