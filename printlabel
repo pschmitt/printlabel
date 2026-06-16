@@ -16,8 +16,9 @@ Options:
       --image PATH     Print an existing image file
       --qr TEXT        Generate and print a QR code (optionally with right-side label text)
       --netbox [QUERY] Resolve a NetBox device, rack, module, or inventory item by id, name, serial, or asset tag
-      --simple         In NetBox mode, print only QR code and asset tag
-      --vertical       In NetBox mode, print QR code and vertical asset tag
+      --simple         In NetBox mode, print only QR code and asset tag (default)
+      --long           In NetBox mode, print QR code, name, asset tag, and serial
+      --vertical       In NetBox mode, rotate the text vertically (combinable with --long)
       --netbox-url URL NetBox base URL, overrides NETBOX_URL
       --netbox-token T NetBox API token, overrides NETBOX_API_TOKEN
       --qr-size PX     Set QR size in pixels before padding
@@ -36,7 +37,9 @@ Examples:
   $(basename "$0") --netbox Schmutzi
   $(basename "$0") --netbox
   $(basename "$0") --netbox 123 --simple
+  $(basename "$0") --netbox 123 --long
   $(basename "$0") --netbox 123 --vertical
+  $(basename "$0") --netbox 123 --long --vertical
   $(basename "$0") --qr 'https://example.com' --black
 EOF
 }
@@ -973,7 +976,7 @@ render_netbox_label() {
   local font_name="$7"
   local qr_size="$8"
   local black_mode="$9"
-  local simple_mode="${10}"
+  local long_mode="${10}"
   local vertical_mode="${11}"
   local qr_source_image
   local qr_image
@@ -1014,11 +1017,8 @@ render_netbox_label() {
   fi
 
   asset_tag="$(normalize_label_line "${asset_tag}")"
-  if [[ -n "${simple_mode}" ]] || [[ -n "${vertical_mode}" ]]
+  if [[ -n "${long_mode}" ]]
   then
-    text_pointsize="${simple_text_pointsize}"
-    text_block="${asset_tag}"
-  else
     object_name="$(normalize_label_line "${object_name}")"
     serial_number="$(normalize_label_line "${serial_number}")"
 
@@ -1031,6 +1031,9 @@ render_netbox_label() {
     then
       text_block="${text_block}"$'\n'"${serial_number}"
     fi
+  else
+    text_pointsize="${simple_text_pointsize}"
+    text_block="${asset_tag}"
   fi
 
   while [[ "${text_pointsize}" -ge 8 ]]
@@ -1239,6 +1242,7 @@ main() {
   local explicit_printer_address="${PRINTLABEL_PRINTER:-}"
   local raw_mode=""
   local simple_mode=""
+  local long_mode=""
   local vertical_mode=""
   local labelmaker_args=()
   local -a positional_args=()
@@ -1317,6 +1321,10 @@ main() {
         ;;
       --simple)
         simple_mode=1
+        shift
+        ;;
+      --long)
+        long_mode=1
         shift
         ;;
       --vertical)
@@ -1400,6 +1408,13 @@ main() {
     return 2
   fi
 
+  if [[ -n "${long_mode}" && -z "${netbox_mode}" ]]
+  then
+    echo "--long can only be used with --netbox." >&2
+    usage >&2
+    return 2
+  fi
+
   if [[ -n "${vertical_mode}" && -z "${netbox_mode}" ]]
   then
     echo "--vertical can only be used with --netbox." >&2
@@ -1407,9 +1422,9 @@ main() {
     return 2
   fi
 
-  if [[ -n "${simple_mode}" && -n "${vertical_mode}" ]]
+  if [[ -n "${simple_mode}" && -n "${long_mode}" ]]
   then
-    echo "Use either --simple or --vertical, not both." >&2
+    echo "Use either --simple or --long, not both." >&2
     usage >&2
     return 2
   fi
@@ -1500,9 +1515,9 @@ main() {
       asset_tag="$("${jq_bin}" -r '.asset_tag // ""' <<< "${netbox_object_json}")" || return 1
       serial_number="$("${jq_bin}" -r '.serial // ""' <<< "${netbox_object_json}")" || return 1
 
-      if [[ ( -n "${simple_mode}" || -n "${vertical_mode}" ) && -z "${asset_tag}" ]]
+      if [[ -z "${long_mode}" && -z "${asset_tag}" ]]
       then
-        echo "NetBox ${netbox_object_kind} ${netbox_object_id} has no asset tag for simple mode." >&2
+        echo "NetBox ${netbox_object_kind} ${netbox_object_id} has no asset tag." >&2
         return 1
       fi
 
@@ -1512,7 +1527,7 @@ main() {
         return 1
       fi
 
-      if [[ -z "${simple_mode}" && -z "${vertical_mode}" && -z "${object_name}" ]]
+      if [[ -n "${long_mode}" && -z "${object_name}" ]]
       then
         echo "NetBox ${netbox_object_kind} ${netbox_object_id} has no name." >&2
         return 1
@@ -1530,7 +1545,7 @@ main() {
         "${font_name}" \
         "${qr_size}" \
         "${black_mode}" \
-        "${simple_mode}" \
+        "${long_mode}" \
         "${vertical_mode}" || return 1
 
       if [[ -n "${invert_mode}" ]]
