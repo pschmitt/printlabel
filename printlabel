@@ -1036,10 +1036,11 @@ render_netbox_label() {
     text_block="${asset_tag}"
   fi
 
-  while [[ "${text_pointsize}" -ge 8 ]]
-  do
+  if [[ -n "${vertical_mode}" ]]
+  then
     text_dimensions="$(
       "${image_tool}" \
+        -size "${qr_size}x" \
         -background white \
         -fill black \
         -font "${font_name}" \
@@ -1050,23 +1051,33 @@ render_netbox_label() {
     )" || return 1
 
     read -r text_width text_height <<< "${text_dimensions}"
+  else
+    while [[ "${text_pointsize}" -ge 8 ]]
+    do
+      text_dimensions="$(
+        "${image_tool}" \
+          -background white \
+          -fill black \
+          -font "${font_name}" \
+          -pointsize "${text_pointsize}" \
+          "label:${text_block}" \
+          -format '%w %h' \
+          info:
+      )" || return 1
 
-    if [[ "${text_width}" =~ ^[0-9]+$ && "${text_height}" =~ ^[0-9]+$ ]]
-    then
-      if [[ -n "${vertical_mode}" ]]
+      read -r text_width text_height <<< "${text_dimensions}"
+
+      if [[ "${text_width}" =~ ^[0-9]+$ && "${text_height}" =~ ^[0-9]+$ ]]
       then
-        if (( text_width <= qr_size ))
+        if (( text_height <= qr_size ))
         then
           break
         fi
-      elif (( text_height <= qr_size ))
-      then
-        break
       fi
-    fi
 
-    text_pointsize=$((text_pointsize - 1))
-  done
+      text_pointsize=$((text_pointsize - 1))
+    done
+  fi
 
   if [[ ! "${text_width}" =~ ^[0-9]+$ || ! "${text_height}" =~ ^[0-9]+$ ]]
   then
@@ -1076,15 +1087,10 @@ render_netbox_label() {
 
   if [[ -n "${vertical_mode}" ]]
   then
-    if (( text_width > qr_size ))
-    then
-      echo "NetBox text block is too wide to fit on the label vertically." >&2
-      return 1
-    fi
-
     local col_width=$((text_height + text_padding))
 
     "${image_tool}" \
+      -size "${qr_size}x" \
       -background white \
       -fill black \
       -font "${font_name}" \
