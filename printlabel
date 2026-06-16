@@ -17,6 +17,7 @@ Options:
       --qr TEXT        Generate and print a QR code (optionally with right-side label text)
       --netbox [QUERY] Resolve a NetBox device, rack, module, or inventory item by id, name, serial, or asset tag
       --simple         In NetBox mode, print only QR code and asset tag
+      --vertical       In NetBox mode, print QR code and vertical asset tag
       --netbox-url URL NetBox base URL, overrides NETBOX_URL
       --netbox-token T NetBox API token, overrides NETBOX_API_TOKEN
       --qr-size PX     Set QR size in pixels before padding
@@ -35,6 +36,7 @@ Examples:
   $(basename "$0") --netbox Schmutzi
   $(basename "$0") --netbox
   $(basename "$0") --netbox 123 --simple
+  $(basename "$0") --netbox 123 --vertical
   $(basename "$0") --qr 'https://example.com' --black
 EOF
 }
@@ -972,6 +974,7 @@ render_netbox_label() {
   local qr_size="$8"
   local black_mode="$9"
   local simple_mode="${10}"
+  local vertical_mode="${11}"
   local qr_source_image
   local qr_image
   local text_image
@@ -1011,7 +1014,7 @@ render_netbox_label() {
   fi
 
   asset_tag="$(normalize_label_line "${asset_tag}")"
-  if [[ -n "${simple_mode}" ]]
+  if [[ -n "${simple_mode}" ]] || [[ -n "${vertical_mode}" ]]
   then
     text_pointsize="${simple_text_pointsize}"
     text_block="${asset_tag}"
@@ -1047,7 +1050,13 @@ render_netbox_label() {
 
     if [[ "${text_width}" =~ ^[0-9]+$ && "${text_height}" =~ ^[0-9]+$ ]]
     then
-      if (( text_height <= qr_size ))
+      if [[ -n "${vertical_mode}" ]]
+      then
+        if (( text_width <= qr_size ))
+        then
+          break
+        fi
+      elif (( text_height <= qr_size ))
       then
         break
       fi
@@ -1062,25 +1071,49 @@ render_netbox_label() {
     return 1
   fi
 
-  if (( text_height > qr_size ))
+  if [[ -n "${vertical_mode}" ]]
   then
-    echo "NetBox text block is too tall to fit on the label." >&2
-    return 1
+    if (( text_width > qr_size ))
+    then
+      echo "NetBox text block is too wide to fit on the label vertically." >&2
+      return 1
+    fi
+
+    local col_width=$((text_height + text_padding))
+
+    "${image_tool}" \
+      -background white \
+      -fill black \
+      -font "${font_name}" \
+      -pointsize "${text_pointsize}" \
+      -gravity center \
+      "label:${text_block}" \
+      -rotate -90 \
+      -gravity center \
+      -background white \
+      -extent "${col_width}x${qr_size}" \
+      "${text_image}" || return 1
+  else
+    if (( text_height > qr_size ))
+    then
+      echo "NetBox text block is too tall to fit on the label." >&2
+      return 1
+    fi
+
+    text_width=$((text_width + text_padding))
+
+    "${image_tool}" \
+      -background white \
+      -fill black \
+      -font "${font_name}" \
+      -pointsize "${text_pointsize}" \
+      -gravity west \
+      "label:${text_block}" \
+      -bordercolor white \
+      -border "${qr_gap}x0" \
+      -extent "${text_width}x${qr_size}" \
+      "${text_image}" || return 1
   fi
-
-  text_width=$((text_width + text_padding))
-
-  "${image_tool}" \
-    -background white \
-    -fill black \
-    -font "${font_name}" \
-    -pointsize "${text_pointsize}" \
-    -gravity west \
-    "label:${text_block}" \
-    -bordercolor white \
-    -border "${qr_gap}x0" \
-    -extent "${text_width}x${qr_size}" \
-    "${text_image}" || return 1
 
   "${image_tool}" \
     "${qr_image}" \
@@ -1206,6 +1239,7 @@ main() {
   local explicit_printer_address="${PRINTLABEL_PRINTER:-}"
   local raw_mode=""
   local simple_mode=""
+  local vertical_mode=""
   local labelmaker_args=()
   local -a positional_args=()
   local qr_tool
@@ -1285,6 +1319,10 @@ main() {
         simple_mode=1
         shift
         ;;
+      --vertical)
+        vertical_mode=1
+        shift
+        ;;
       --image)
         if [[ -z "${2:-}" ]]
         then
@@ -1358,6 +1396,20 @@ main() {
   if [[ -n "${simple_mode}" && -z "${netbox_mode}" ]]
   then
     echo "--simple can only be used with --netbox." >&2
+    usage >&2
+    return 2
+  fi
+
+  if [[ -n "${vertical_mode}" && -z "${netbox_mode}" ]]
+  then
+    echo "--vertical can only be used with --netbox." >&2
+    usage >&2
+    return 2
+  fi
+
+  if [[ -n "${simple_mode}" && -n "${vertical_mode}" ]]
+  then
+    echo "Use either --simple or --vertical, not both." >&2
     usage >&2
     return 2
   fi
@@ -1448,9 +1500,9 @@ main() {
       asset_tag="$("${jq_bin}" -r '.asset_tag // ""' <<< "${netbox_object_json}")" || return 1
       serial_number="$("${jq_bin}" -r '.serial // ""' <<< "${netbox_object_json}")" || return 1
 
-      if [[ -n "${simple_mode}" && -z "${asset_tag}" ]]
+      if [[ ( -n "${simple_mode}" || -n "${vertical_mode}" ) && -z "${asset_tag}" ]]
       then
-        echo "NetBox ${netbox_object_kind} ${netbox_object_id} has no asset tag for --simple mode." >&2
+        echo "NetBox ${netbox_object_kind} ${netbox_object_id} has no asset tag for simple mode." >&2
         return 1
       fi
 
@@ -1460,7 +1512,7 @@ main() {
         return 1
       fi
 
-      if [[ -z "${simple_mode}" && -z "${object_name}" ]]
+      if [[ -z "${simple_mode}" && -z "${vertical_mode}" && -z "${object_name}" ]]
       then
         echo "NetBox ${netbox_object_kind} ${netbox_object_id} has no name." >&2
         return 1
@@ -1478,7 +1530,8 @@ main() {
         "${font_name}" \
         "${qr_size}" \
         "${black_mode}" \
-        "${simple_mode}" || return 1
+        "${simple_mode}" \
+        "${vertical_mode}" || return 1
 
       if [[ -n "${invert_mode}" ]]
       then
