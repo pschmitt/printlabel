@@ -22,6 +22,7 @@ Options:
       --netbox-url URL NetBox base URL, overrides NETBOX_URL
       --netbox-token T NetBox API token, overrides NETBOX_API_TOKEN
       --qr-size PX     Set QR size in pixels before padding
+      --scale FACTOR   Scale the final label (e.g. 0.8 or 80%)
       --black          Invert QR codes for black tape
       --invert         Invert black and white
       --preview        Preview in terminal when possible
@@ -401,6 +402,32 @@ apply_invert() {
   "${image_tool}" \
     "${source_image}" \
     -negate \
+    "${target_image}"
+}
+
+normalize_scale() {
+  local input="$1"
+
+  if [[ "${input}" == *% ]]
+  then
+    printf '%s\n' "${input}"
+  else
+    awk -v v="${input}" 'BEGIN { printf "%.4g%%\n", v * 100 }'
+  fi
+}
+
+apply_scale() {
+  local image_tool="$1"
+  local source_image="$2"
+  local target_image="$3"
+  local scale="$4"
+  local scale_pct
+
+  scale_pct="$(normalize_scale "${scale}")" || return 1
+
+  "${image_tool}" \
+    "${source_image}" \
+    -resize "${scale_pct}" \
     "${target_image}"
 }
 
@@ -1247,6 +1274,7 @@ main() {
   local qr_text=""
   local explicit_printer_address="${PRINTLABEL_PRINTER:-}"
   local raw_mode=""
+  local scale=""
   local simple_mode=""
   local long_mode=""
   local vertical_mode=""
@@ -1375,6 +1403,16 @@ main() {
           return 2
         fi
         qr_size="$2"
+        shift 2
+        ;;
+      --scale)
+        if [[ -z "${2:-}" ]]
+        then
+          echo "Missing factor after --scale." >&2
+          usage >&2
+          return 2
+        fi
+        scale="$2"
         shift 2
         ;;
       --black)
@@ -1598,6 +1636,11 @@ main() {
       apply_invert "${image_tool}" "${label_image}" "${label_image}" || return 1
     fi
     preview_label "${preview_mode}" || return 1
+  fi
+
+  if [[ -n "${scale}" ]]
+  then
+    apply_scale "${image_tool}" "${label_image}" "${label_image}" "${scale}" || return 1
   fi
 
   printer_address="$(discover_printer_address "${explicit_printer_address}")" || return 1
