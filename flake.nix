@@ -67,6 +67,7 @@
                 pkgs.kitty
                 nbxPkg
                 pkgs.qrencode
+                pkgs.timg
                 python
               ]} \
               --set PYTHONPATH "$out/libexec/printlabel" \
@@ -106,6 +107,7 @@
             nbxPkg
             pkgs.qrencode
             pkgs.shellcheck
+            pkgs.timg
             python
           ];
         };
