@@ -491,6 +491,25 @@ can_preview_with_kitty() {
   kitten icat --detect-support >/dev/null 2>&1
 }
 
+can_render_with_kitty_preview() {
+  if [[ -z "${KITTY_WINDOW_ID:-}" ]]
+  then
+    return 1
+  fi
+
+  if ! command -v kitten >/dev/null 2>&1
+  then
+    return 1
+  fi
+
+  if [[ -n "${PRINTLABEL_FORCE_KITTY:-}" ]]
+  then
+    return 0
+  fi
+
+  [[ -t 1 ]]
+}
+
 can_render_with_timg() {
   if ! [[ -t 1 ]]
   then
@@ -500,7 +519,46 @@ can_render_with_timg() {
   command -v timg >/dev/null 2>&1
 }
 
-render_terminal_image() {
+render_terminal_image_with_kitty() {
+  local image_path="$1"
+  local image_tool
+  local tmp_image
+
+  if ! can_render_with_kitty_preview
+  then
+    return 1
+  fi
+
+  if command -v magick >/dev/null 2>&1
+  then
+    image_tool="magick"
+  elif command -v convert >/dev/null 2>&1
+  then
+    image_tool="convert"
+  else
+    return 1
+  fi
+
+  tmp_image="$(mktemp --suffix=.png printlabel-preview.XXXXXX)" || return 1
+  "${image_tool}" "${image_path}" -resize x200 "${tmp_image}" >/dev/null 2>&1 || {
+    rm -f "${tmp_image}"
+    return 1
+  }
+
+  kitten icat --clear >/dev/null 2>&1 || true
+  kitten icat \
+    --stdin=no \
+    --transfer-mode=stream \
+    --align=left \
+    --no-trailing-newline \
+    "${tmp_image}" || {
+    rm -f "${tmp_image}"
+    return 1
+  }
+  rm -f "${tmp_image}"
+}
+
+render_terminal_image_with_timg() {
   local timg_bin="$1"
   local image_path="$2"
   local -a timg_args=()
@@ -511,6 +569,19 @@ render_terminal_image() {
   fi
 
   "${timg_bin}" "${timg_args[@]}" "${image_path}"
+}
+
+render_terminal_image() {
+  local timg_bin="$1"
+  local image_path="$2"
+
+  if [[ -n "${FZF_PREVIEW_LINES:-}" || -n "${FZF_PREVIEW_COLUMNS:-}" ]]
+  then
+    render_terminal_image_with_kitty "${image_path}"
+    return $?
+  fi
+
+  render_terminal_image_with_timg "${timg_bin}" "${image_path}"
 }
 
 resolve_netbox_device_image_url() {
@@ -579,15 +650,24 @@ print_netbox_device_image() {
   local netbox_object_json="$2"
   local netbox_url="$3"
   local netbox_token="$4"
-  local timg_bin
+  local timg_bin=""
   local image_path
 
-  if ! can_render_with_timg
+  if [[ -n "${FZF_PREVIEW_LINES:-}" || -n "${FZF_PREVIEW_COLUMNS:-}" ]]
   then
-    return 0
+    if ! can_render_with_kitty_preview
+    then
+      return 0
+    fi
+  else
+    if ! can_render_with_timg
+    then
+      return 0
+    fi
+
+    timg_bin="$(find_timg)" || return 0
   fi
 
-  timg_bin="$(find_timg)" || return 0
   image_path="$(
     cache_netbox_device_image "${nbx_bin}" "${netbox_object_json}" "${netbox_url}" "${netbox_token}"
   )" || return 0
@@ -1099,7 +1179,7 @@ select_netbox_object() {
   printf -v preview_cache '%q' "${cache_file}"
   printf -v preview_netbox_url '%q' "${netbox_url}"
   printf -v preview_netbox_token '%q' "${netbox_token}"
-  preview_command="PRINTLABEL_FORCE_COLOR=1 NETBOX_URL=${preview_netbox_url} NETBOX_API_TOKEN=${preview_netbox_token} ${preview_script} --netbox-fzf-preview ${preview_cache} {1}"
+  preview_command="PRINTLABEL_FORCE_COLOR=1 PRINTLABEL_FORCE_KITTY=1 NETBOX_URL=${preview_netbox_url} NETBOX_API_TOKEN=${preview_netbox_token} ${preview_script} --netbox-fzf-preview ${preview_cache} {1}"
   fzf_args=(
     --ansi
     --delimiter=$'\t'
